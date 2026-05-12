@@ -114,6 +114,114 @@ def safe_to_numeric(series):
         .fillna(0)
     )
 
+def parse_date_safe(value):
+    """
+    여러 형태의 날짜 문자열을 안전하게 datetime으로 변환
+    """
+    if pd.isna(value):
+        return pd.NaT
+
+    value = str(value).strip()
+
+    if value == "":
+        return pd.NaT
+
+    # YYYYMMDD
+    if len(value) == 8 and value.isdigit():
+        return pd.to_datetime(value, format="%Y%m%d", errors="coerce")
+
+    # YYYYMMDDHHMM
+    if len(value) == 12 and value.isdigit():
+        return pd.to_datetime(value, format="%Y%m%d%H%M", errors="coerce")
+
+    # 일반 날짜형
+    return pd.to_datetime(value, errors="coerce")
+
+
+def add_nara_sales_urgency(df):
+    """
+    나라장터 입찰마감일 기준 영업 긴급도 생성
+    """
+    today = pd.Timestamp.today().normalize()
+
+    # 공고일 변환
+    if "bidNtceDate" in df.columns:
+        df["공고일_변환"] = df["bidNtceDate"].apply(parse_date_safe)
+    else:
+        df["공고일_변환"] = pd.NaT
+
+    # 입찰마감일 변환
+    if "bidClseDate" in df.columns:
+        df["입찰마감일_변환"] = df["bidClseDate"].apply(parse_date_safe)
+    else:
+        df["입찰마감일_변환"] = pd.NaT
+
+    # 개찰일 변환
+    if "opengDate" in df.columns:
+        df["개찰일_변환"] = df["opengDate"].apply(parse_date_safe)
+    else:
+        df["개찰일_변환"] = pd.NaT
+
+    # 나라장터 목록 API에는 준공예정일이 없을 가능성이 높으므로 기본값 처리
+    if "준공예정일" not in df.columns:
+        df["준공예정일"] = "공고문 확인 필요"
+
+    df["입찰마감까지_남은일수"] = (
+        df["입찰마감일_변환"] - today
+    ).dt.days
+
+    def classify_urgency(days):
+        if pd.isna(days):
+            return "일정 미확인"
+        elif days < 0:
+            return "마감"
+        elif days <= 2:
+            return "매우 긴급"
+        elif days <= 5:
+            return "긴급"
+        elif days <= 10:
+            return "주의"
+        else:
+            return "여유"
+
+    df["영업긴급도"] = df["입찰마감까지_남은일수"].apply(classify_urgency)
+
+    return df
+
+
+def add_cals_sales_urgency(df):
+    """
+    CALS 준공예정일 기준 영업 긴급도 생성
+    """
+    today = pd.Timestamp.today().normalize()
+
+    if "ccwXpcDt" in df.columns:
+        df["준공예정일_변환"] = df["ccwXpcDt"].apply(parse_date_safe)
+    else:
+        df["준공예정일_변환"] = pd.NaT
+
+    df["준공예정일까지_남은일수"] = (
+        df["준공예정일_변환"] - today
+    ).dt.days
+
+    def classify_cals_urgency(days):
+        if pd.isna(days):
+            return "일정 미확인"
+        elif days < 0:
+            return "기간 경과 확인"
+        elif days <= 30:
+            return "매우 긴급"
+        elif days <= 90:
+            return "긴급"
+        elif days <= 180:
+            return "주의"
+        else:
+            return "여유"
+
+    df["영업긴급도"] = df["준공예정일까지_남은일수"].apply(classify_cals_urgency)
+
+    return df
+
 
 # =========================================================
 # 1. 나라장터 공사입찰 수집
@@ -624,6 +732,7 @@ def rename_columns_korean(df):
         "bzKdNm": "사업종류",
         "stwrDt": "착공일",
         "ccwDt": "준공일",
+        "ccwXpcDt": "준공예정일",
         "ccwYnNm": "진행상태",
         "bzarNm": "분야",
         "cwkSctnNm": "공사구간",
@@ -645,6 +754,17 @@ def rename_columns_korean(df):
         "철근수요지수": "철근 수요지수",
         "통합수요지수": "통합 수요지수",
         "수요등급": "수요등급",
+
+        # 날짜/긴급도
+"공고일_변환": "공고일",
+"입찰마감일_변환": "입찰마감일",
+"개찰일_변환": "개찰일",
+"입찰마감까지_남은일수": "입찰마감까지 남은일수",
+"준공예정일": "준공예정일",
+"ccwXpcDt": "준공예정일",
+"준공예정일_변환": "준공예정일",
+"준공예정일까지_남은일수": "준공예정일까지 남은일수",
+"영업긴급도": "영업긴급도",
     }
 
     return df.rename(columns=column_map)
