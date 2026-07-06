@@ -1,0 +1,37 @@
+name: Generate steel demand report
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 15 * * *"
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+
+    env:
+      NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
+      CALS_API_KEY: ${{ secrets.CALS_API_KEY }}
+      NARA_LOOKBACK_DAYS: "7"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate integrated steel demand report
+        run: python integrated_steel_report.py
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: integrated-steel-demand-report
+          path: data/processed/integrated_steel_demand_report_*.xlsx
+          if-no-files-found: error
