@@ -4,8 +4,14 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+
+try:
+    from integrated_steel_report import classify_region_by_text
+except Exception:
+    classify_region_by_text = None
 
 
 # =========================================================
@@ -54,6 +60,28 @@ def run_integrated_report():
     )
 
     return result
+
+
+@st.cache_data(show_spinner=False)
+def load_report_preview(file_path):
+    preview = {}
+
+    try:
+        preview["통합_수요지수"] = pd.read_excel(file_path, sheet_name="통합_수요지수")
+    except Exception:
+        preview["통합_수요지수"] = pd.DataFrame()
+
+    try:
+        preview["나라장터_철근입찰"] = pd.read_excel(file_path, sheet_name="나라장터_철근입찰")
+    except Exception:
+        preview["나라장터_철근입찰"] = pd.DataFrame()
+
+    try:
+        preview["CALS_수요지수"] = pd.read_excel(file_path, sheet_name="CALS_수요지수")
+    except Exception:
+        preview["CALS_수요지수"] = pd.DataFrame()
+
+    return preview
 
 
 # =========================================================
@@ -207,6 +235,108 @@ st.divider()
 
 
 # =========================================================
+# 최신 리포트 미리보기
+# =========================================================
+
+if latest_file:
+    preview = load_report_preview(str(latest_file))
+    integrated_df = preview["통합_수요지수"]
+    nara_steel_df = preview["나라장터_철근입찰"]
+    cals_demand_df = preview["CALS_수요지수"]
+
+    st.markdown("## 📌 최신 리포트 요약")
+
+    top_region = "데이터 없음"
+    top_score = 0
+    if not integrated_df.empty and "지역" in integrated_df.columns:
+        top_region = str(integrated_df.iloc[0]["지역"])
+    if not integrated_df.empty and "통합 수요지수" in integrated_df.columns:
+        top_score = integrated_df.iloc[0]["통합 수요지수"]
+
+    urgent_count = 0
+    priority_count = 0
+    if not nara_steel_df.empty and "영업긴급도" in nara_steel_df.columns:
+        urgent_count = nara_steel_df["영업긴급도"].isin(["매우 긴급", "긴급"]).sum()
+    if not nara_steel_df.empty and "영업우선순위" in nara_steel_df.columns:
+        priority_count = nara_steel_df["영업우선순위"].isin(["A. 즉시 확인", "B. 우선 검토"]).sum()
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+
+    with metric1:
+        st.metric("통합 수요 1위", top_region)
+
+    with metric2:
+        st.metric("1위 지역 수요지수", f"{top_score:,.1f}" if isinstance(top_score, (int, float)) else top_score)
+
+    with metric3:
+        st.metric("긴급 입찰", f"{urgent_count:,}건")
+
+    with metric4:
+        st.metric("A/B 우선 검토", f"{priority_count:,}건")
+
+    if not integrated_df.empty:
+        display_cols = [
+            col for col in [
+                "통합순위",
+                "지역",
+                "통합 수요지수",
+                "수요등급",
+                "나라장터 철근관련 입찰건수",
+                "CALS 철근수요지수",
+                "신규입찰비중",
+                "권장영업액션",
+            ]
+            if col in integrated_df.columns
+        ]
+
+        st.markdown("### 지역별 통합 수요지수")
+        st.dataframe(
+            integrated_df[display_cols].head(10),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        chart_cols = [col for col in ["지역", "통합 수요지수"] if col in integrated_df.columns]
+        if len(chart_cols) == 2:
+            chart_df = integrated_df[chart_cols].head(10).set_index("지역")
+            st.bar_chart(chart_df)
+
+    if not nara_steel_df.empty:
+        priority_cols = [
+            col for col in [
+                "입찰공고명",
+                "수요기관",
+                "지역",
+                "추정가격구간",
+                "영업긴급도",
+                "영업우선순위",
+                "권장영업액션",
+                "입찰마감까지 남은일수",
+            ]
+            if col in nara_steel_df.columns
+        ]
+
+        if priority_cols:
+            st.markdown("### 나라장터 우선 확인 입찰")
+            sort_cols = [col for col in ["영업우선순위점수", "추정가격_숫자"] if col in nara_steel_df.columns]
+            priority_df = nara_steel_df.copy()
+            if sort_cols:
+                priority_df = priority_df.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
+
+            st.dataframe(
+                priority_df[priority_cols].head(15),
+                use_container_width=True,
+                hide_index=True
+            )
+
+    if not cals_demand_df.empty:
+        with st.expander("CALS 수요지수 보기"):
+            st.dataframe(cals_demand_df.head(15), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+
+# =========================================================
 # 안내 카드
 # =========================================================
 
@@ -249,6 +379,18 @@ with info_col3:
         """,
         unsafe_allow_html=True
     )
+
+with st.expander("지역분류 로직 확인"):
+    st.caption("나라장터는 수요기관, 공고기관, 공고명을 함께 보고 지역을 판정합니다. CALS는 발주기관명을 기준으로 판정합니다.")
+    sample_text = st.text_input(
+        "기관명 또는 공고명을 입력하면 동일한 지역분류 함수로 판정합니다.",
+        value="한국농어촌공사 충남지역본부 보령지사 스마트팜 단지조성사업"
+    )
+
+    if classify_region_by_text is None:
+        st.warning("지역분류 함수를 불러오지 못했습니다. integrated_steel_report.py 파일을 확인하세요.")
+    else:
+        st.info(f"판정 지역: {classify_region_by_text(sample_text)}")
 
 st.divider()
 
@@ -308,6 +450,7 @@ if st.button("🚀 최신 통합 리포트 생성하기", type="primary", use_co
 
     else:
         st.success(f"리포트 생성 완료! 소요 시간: {elapsed:.1f}초")
+        load_report_preview.clear()
 
         latest_file = get_latest_report_file()
 
