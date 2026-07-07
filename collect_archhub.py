@@ -2,6 +2,7 @@ import os
 import math
 import time
 import json
+import re
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -190,20 +191,154 @@ def split_lawdong_code(code):
     return code, code[:5], code[5:]
 
 
+def _clean_reference_columns(df):
+    df = df.copy()
+    df.columns = [str(col).strip().replace("\ufeff", "") for col in df.columns]
+    return df
+
+
+def _manual_parse_bjdong_reference(path, encoding):
+    """
+    GitHub 웹 편집/엑셀 복사 과정에서 CSV가 탭 또는 공백 정렬 텍스트처럼 저장되는 경우를 대비한 보정 파서입니다.
+    최소한 법정동코드, sigunguCd, bjdongCd, 지역, 시도명, 시군구명, 읍면동명, 법정동명, 생성일자를 복원합니다.
+    """
+    text = Path(path).read_text(encoding=encoding, errors="replace")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    if not lines:
+        return pd.DataFrame()
+
+    # 탭 구분 파일이면 우선 탭 기준으로 복원합니다.
+    if "\t" in lines[0]:
+        header = [col.strip().replace("\ufeff", "") for col in lines[0].split("\t")]
+        rows = []
+        for line in lines[1:]:
+            values = [value.strip() for value in line.split("\t")]
+            if len(values) < len(header):
+                values += [""] * (len(header) - len(values))
+            rows.append(values[:len(header)])
+        df = pd.DataFrame(rows, columns=header)
+        return _clean_reference_columns(df)
+
+    # 공백 정렬 텍스트로 저장된 경우의 최후 보정.
+    # 법정동명은 공백을 포함할 수 있으므로, 앞쪽 고정 컬럼과 마지막 날짜만 확정적으로 분리합니다.
+    rows = []
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 7:
+            continue
+
+        lawdong_code = parts[0]
+        if not str(lawdong_code).isdigit():
+            continue
+
+        sigungu_cd = parts[1] if len(parts) > 1 else str(lawdong_code)[:5]
+        bjdong_cd = parts[2] if len(parts) > 2 else str(lawdong_code)[5:]
+        region = parts[3] if len(parts) > 3 else region_from_sigungu(sigungu_cd)
+        sido_name = parts[4] if len(parts) > 4 else ""
+        sigungu_name = parts[5] if len(parts) > 5 else ""
+        eupmyeondong_name = parts[6] if len(parts) > 6 else ""
+
+        created_day = ""
+        tail = parts[7:]
+        if tail and re.match(r"^\d{4}-\d{2}-\d{2}$", tail[-1]):
+            created_day = tail[-1]
+            tail = tail[:-1]
+
+        # 리명은 정확 복원이 어려우므로 비워두고, 남은 문자열을 법정동명으로 둡니다.
+        # 수요지수 산정에는 법정동명보다 sigunguCd/bjdongCd/지역이 중요합니다.
+        lawdong_name = " ".join(tail).strip()
+        if not lawdong_name:
+            lawdong_name = " ".join([sido_name, sigungu_name, eupmyeondong_name]).strip()
+
+        rows.append({
+            "법정동코드": lawdong_code,
+            "sigunguCd": sigungu_cd,
+            "bjdongCd": bjdong_cd,
+            "지역": region,
+            "시도명": sido_name,
+            "시군구명": sigungu_name,
+            "읍면동명": eupmyeondong_name,
+            "리명": "",
+            "법정동명": lawdong_name,
+            "생성일자": created_day,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def read_bjdong_reference_file(path):
+    """
+    기준 파일을 쉼표 CSV, 탭 TSV, 자동 구분자, 공백 정렬 텍스트 순서로 읽습니다.
+    GitHub 웹에서 CSV를 수정하면서 탭/공백 형태로 바뀐 경우까지 흡수합니다.
+    """
+    path = Path(path)
+    encodings = ["utf-8-sig", "utf-8", "cp949", "euc-kr"]
+    attempts = []
+
+    for encoding in encodings:
+        for sep, engine in [(",", "c"), ("\t", "c"), (";", "c"), ("|", "c"), (None, "python")]:
+            try:
+                kwargs = {
+                    "dtype": str,
+                    "encoding": encoding,
+                    "keep_default_na": False,
+                }
+                if sep is None:
+                    kwargs["sep"] = None
+                    kwargs["engine"] = "python"
+                else:
+                    kwargs["sep"] = sep
+                    if engine == "python":
+                        kwargs["engine"] = "python"
+
+                df = pd.read_csv(path, **kwargs)
+                df = _clean_reference_columns(df)
+
+                if "법정동코드" in df.columns and len(df.columns) > 1:
+                    print(f"[법정동 기준] 파일 읽기 성공: encoding={encoding}, sep={repr(sep)}")
+                    return df
+
+                attempts.append(f"encoding={encoding}, sep={repr(sep)}, columns={list(df.columns)[:3]}")
+            except Exception as exc:
+                attempts.append(f"encoding={encoding}, sep={repr(sep)}, error={type(exc).__name__}: {exc}")
+
+    for encoding in encodings:
+        try:
+            df = _manual_parse_bjdong_reference(path, encoding)
+            df = _clean_reference_columns(df)
+            if "법정동코드" in df.columns and not df.empty:
+                print(f"[법정동 기준] 수동 파싱 성공: encoding={encoding}")
+                return df
+        except Exception as exc:
+            attempts.append(f"manual encoding={encoding}, error={type(exc).__name__}: {exc}")
+
+    print("[법정동 기준 오류] 파일 읽기 시도 내역")
+    for item in attempts[:20]:
+        print("-", item)
+
+    raise ValueError(
+        "법정동코드 컬럼이 필요합니다. "
+        "data/reference/bjdong_codes_for_archhub.csv 파일이 쉼표 CSV 또는 탭 TSV 형식인지 확인하세요."
+    )
+
+
 def normalize_bjdong_reference(path):
     """
-    지원 파일 형식 2가지:
+    지원 파일 형식:
     1) 전처리 파일: 법정동코드,sigunguCd,bjdongCd,지역,시도명,시군구명,읍면동명,리명,법정동명
     2) 원본 파일: 법정동코드,시도명,시군구명,읍면동명,리명,순위,생성일자,삭제일자
+    3) GitHub/Excel에서 생긴 탭 구분 또는 공백 정렬 텍스트
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"법정동코드 기준 파일을 찾을 수 없습니다: {path}")
 
-    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
-    df.columns = [str(col).strip() for col in df.columns]
+    df = read_bjdong_reference_file(path)
+    df.columns = [str(col).strip().replace("\ufeff", "") for col in df.columns]
 
     if "법정동코드" not in df.columns:
+        print("[법정동 기준 오류] 현재 컬럼:", list(df.columns))
         raise ValueError("법정동코드 컬럼이 필요합니다.")
 
     df = df.copy()
@@ -247,7 +382,6 @@ def normalize_bjdong_reference(path):
         ).str.replace(r"\s+", " ", regex=True).str.strip()
 
     # 리 단위가 존재하는 읍/면은 리 단위만 사용하고, 부모 읍/면 행은 제외
-    # 예: 1111010100 같은 동 지역은 keep / 4413325000 아래 4413325021 등이 있으면 25000은 drop
     df["읍면동그룹"] = df["법정동코드"].str[:8]
     df["리코드"] = df["법정동코드"].str[8:]
     group_has_ri = df.groupby("읍면동그룹")["리코드"].transform(lambda s: (s != "00").any())
@@ -270,7 +404,6 @@ def normalize_bjdong_reference(path):
         cols.append("생성일자")
 
     return df[[col for col in cols if col in df.columns]].reset_index(drop=True)
-
 
 def save_normalized_reference_if_needed(ref_df):
     """
