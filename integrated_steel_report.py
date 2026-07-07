@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import json
 import requests
 import urllib3
 import pandas as pd
@@ -40,6 +41,7 @@ def get_secret(key):
 
 NARA_API_KEY = get_secret("NARA_API_KEY")
 CALS_API_KEY = get_secret("CALS_API_KEY")
+ARCHHUB_API_KEY = get_secret("ARCHHUB_API_KEY") or get_secret("NARA_API_KEY")
 
 
 BASE_DIR = Path(__file__).parent
@@ -47,8 +49,24 @@ BASE_DIR = Path(__file__).parent
 SAVE_PATH = BASE_DIR / "data" / "processed"
 SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
+CACHE_PATH = BASE_DIR / "data" / "cache"
+CACHE_PATH.mkdir(parents=True, exist_ok=True)
+
 NOW = datetime.now().strftime("%Y%m%d_%H%M%S")
 NARA_LOOKBACK_DAYS = int(os.getenv("NARA_LOOKBACK_DAYS", "7"))
+
+ARCHHUB_ENABLED = os.getenv("ARCHHUB_ENABLED", "true").lower() not in ["0", "false", "no", "n"]
+ARCHHUB_LOOKBACK_DAYS = int(os.getenv("ARCHHUB_LOOKBACK_DAYS", "90"))
+ARCHHUB_MODE = os.getenv("ARCHHUB_MODE", "sample")  # single 또는 sample
+ARCHHUB_SIGUNGU_CD = os.getenv("ARCHHUB_SIGUNGU_CD", "11680")
+ARCHHUB_BJDONG_CD = os.getenv("ARCHHUB_BJDONG_CD", "")
+ARCHHUB_MAX_PAGES = int(os.getenv("ARCHHUB_MAX_PAGES", "1"))  # 0이면 전체 페이지
+ARCHHUB_NUM_ROWS = int(os.getenv("ARCHHUB_NUM_ROWS", "100"))
+ARCHHUB_CACHE_HOURS = int(os.getenv("ARCHHUB_CACHE_HOURS", "24"))
+ARCHHUB_FORCE_REFRESH = os.getenv("ARCHHUB_FORCE_REFRESH", "false").lower() in ["1", "true", "yes", "y"]
+
+ARCHHUB_BASIS_URL = "https://apis.data.go.kr/1613000/ArchPmsHubService/getApBasisOulnInfo"
+
 
 
 def require_api_key(value, key_name):
@@ -56,6 +74,53 @@ def require_api_key(value, key_name):
         return value
 
     raise ValueError(f"{key_name}를 찾을 수 없습니다. .env, Streamlit Secrets, GitHub Secrets를 확인하세요.")
+
+
+ARCHHUB_SIDO_PREFIX_MAP = {
+    "11": "서울",
+    "26": "부산",
+    "27": "대구",
+    "28": "인천",
+    "29": "광주",
+    "30": "대전",
+    "31": "울산",
+    "36": "세종",
+    "41": "경기",
+    "42": "강원",
+    "43": "충북",
+    "44": "충남",
+    "45": "전북",
+    "46": "전남",
+    "47": "경북",
+    "48": "경남",
+    "50": "제주",
+    "51": "강원",
+    "52": "전북",
+}
+
+# 1차 MVP용 대표 시군구 샘플입니다.
+# 전국 전체 수집은 법정동 코드 목록 확보 후 별도 확장하는 것을 권장합니다.
+ARCHHUB_SAMPLE_SIGUNGU_CODES = {
+    "서울_강남구": "11680",
+    "서울_송파구": "11710",
+    "경기_성남분당구": "41135",
+    "경기_화성시": "41590",
+    "인천_연수구": "28185",
+    "부산_해운대구": "26350",
+    "대구_수성구": "27260",
+    "대전_유성구": "30200",
+    "광주_광산구": "29200",
+    "울산_울주군": "31710",
+    "세종": "36110",
+    "충북_청주시흥덕구": "43113",
+    "충남_천안서북구": "44133",
+    "전북_전주덕진구": "45113",
+    "전남_나주시": "46170",
+    "경북_포항북구": "47113",
+    "경남_창원성산구": "48123",
+    "강원_원주시": "51130",
+    "제주_제주시": "50110",
+}
 
 
 # =========================================================
@@ -595,6 +660,23 @@ def parse_date_safe(value):
     return pd.to_datetime(value, errors="coerce")
 
 
+def first_existing_col(df, candidates):
+    for col in candidates:
+        if col in df.columns:
+            return col
+
+    return None
+
+
+def get_series_or_default(df, candidates, default=""):
+    col = first_existing_col(df, candidates)
+
+    if col is None:
+        return pd.Series([default] * len(df), index=df.index)
+
+    return df[col]
+
+
 def add_nara_sales_urgency(df):
     """
     나라장터 입찰마감일 기준 영업 긴급도 생성
@@ -788,6 +870,598 @@ def add_cals_sales_columns(df):
     df["권장영업액션"] = df.apply(recommend_action, axis=1)
 
     return df
+
+
+# =========================================================
+# 건축HUB 공통/수집/캐시 함수
+# =========================================================
+
+def archhub_region_from_sigungu(sigungu_cd):
+    sigungu_cd = str(sigungu_cd).strip()
+
+    if len(sigungu_cd) >= 2:
+        return ARCHHUB_SIDO_PREFIX_MAP.get(sigungu_cd[:2], "기타")
+
+    return "기타"
+
+
+def archhub_extract_items(data):
+    response = data.get("response", {}) if isinstance(data, dict) else {}
+    body = response.get("body", {}) if isinstance(response, dict) else {}
+    items = body.get("items", []) if isinstance(body, dict) else []
+
+    if isinstance(items, dict) and "item" in items:
+        items = items["item"]
+
+    if isinstance(items, dict):
+        items = [items]
+
+    if items is None:
+        items = []
+
+    return items
+
+
+def archhub_get_total_count(data):
+    response = data.get("response", {}) if isinstance(data, dict) else {}
+    body = response.get("body", {}) if isinstance(response, dict) else {}
+    total_count = body.get("totalCount", 0) if isinstance(body, dict) else 0
+
+    try:
+        return int(total_count)
+    except Exception:
+        return 0
+
+
+def archhub_get_result_info(data):
+    response = data.get("response", {}) if isinstance(data, dict) else {}
+    header = response.get("header", {}) if isinstance(response, dict) else {}
+
+    result_code = header.get("resultCode", "") if isinstance(header, dict) else ""
+    result_msg = header.get("resultMsg", "") if isinstance(header, dict) else ""
+
+    return result_code, result_msg
+
+
+def archhub_is_response_ok(data):
+    if data is None:
+        return False
+
+    result_code, _ = archhub_get_result_info(data)
+
+    if result_code in ["00", "NORMAL_SERVICE"]:
+        return True
+
+    response = data.get("response", {}) if isinstance(data, dict) else {}
+    body = response.get("body", {}) if isinstance(response, dict) else {}
+
+    if isinstance(body, dict):
+        if "items" in body:
+            return True
+
+        if "totalCount" in body:
+            try:
+                int(body.get("totalCount", 0))
+                return True
+            except Exception:
+                pass
+
+    return False
+
+
+def archhub_response_json(response):
+    try:
+        return response.json()
+    except Exception:
+        print("[건축HUB 오류] JSON 변환 실패")
+        print("응답 앞부분:")
+        print((response.text or "")[:500])
+        return None
+
+
+def archhub_request_page(
+    sigungu_cd,
+    start_date,
+    end_date,
+    page_no=1,
+    num_of_rows=100,
+    bjdong_cd="",
+):
+    params = {
+        "serviceKey": require_api_key(ARCHHUB_API_KEY, "ARCHHUB_API_KEY 또는 NARA_API_KEY"),
+        "sigunguCd": sigungu_cd,
+        "startDate": start_date,
+        "endDate": end_date,
+        "numOfRows": str(num_of_rows),
+        "pageNo": str(page_no),
+        "_type": "json",
+    }
+
+    if str(bjdong_cd).strip() != "":
+        params["bjdongCd"] = str(bjdong_cd).strip()
+
+    response = requests.get(
+        ARCHHUB_BASIS_URL,
+        params=params,
+        timeout=30,
+        verify=False,
+    )
+
+    bjdong_label = params.get("bjdongCd", "전체")
+
+    print(
+        f"[건축HUB] sigunguCd={sigungu_cd or '전체'} "
+        f"bjdongCd={bjdong_label} page={page_no} status={response.status_code}"
+    )
+
+    data = archhub_response_json(response)
+
+    if data is None:
+        return None, response.status_code
+
+    result_code, result_msg = archhub_get_result_info(data)
+    print(f"[건축HUB] resultCode={result_code}, resultMsg={result_msg}")
+
+    return data, response.status_code
+
+
+def collect_archhub_basis_by_sigungu(
+    sigungu_cd,
+    start_date,
+    end_date,
+    bjdong_cd="",
+    max_pages=1,
+    num_of_rows=100,
+    sleep_sec=0.2,
+    fallback_bjdong_cd="10100",
+):
+    """
+    건축HUB 기본개요를 시군구 기준으로 수집합니다.
+
+    현재 getApBasisOulnInfo는 일부 조건에서 bjdongCd 없는 시군구 전체 조회가
+    HTTP 200이지만 resultCode/items가 비어 있는 응답을 줄 수 있습니다.
+    이 경우 1차 MVP에서는 fallback 법정동 코드로 재시도합니다.
+    """
+    data, status_code = archhub_request_page(
+        sigungu_cd=sigungu_cd,
+        bjdong_cd=bjdong_cd,
+        start_date=start_date,
+        end_date=end_date,
+        page_no=1,
+        num_of_rows=num_of_rows,
+    )
+
+    used_bjdong_cd = bjdong_cd
+
+    if data is None or status_code >= 500 or not archhub_is_response_ok(data):
+        if str(bjdong_cd).strip() == "" and fallback_bjdong_cd:
+            print(
+                f"[건축HUB 재시도] 시군구 전체 조회가 유효하지 않음 → "
+                f"fallback bjdongCd={fallback_bjdong_cd}"
+            )
+            data, status_code = archhub_request_page(
+                sigungu_cd=sigungu_cd,
+                bjdong_cd=fallback_bjdong_cd,
+                start_date=start_date,
+                end_date=end_date,
+                page_no=1,
+                num_of_rows=num_of_rows,
+            )
+            used_bjdong_cd = fallback_bjdong_cd
+
+    if data is None:
+        return pd.DataFrame()
+
+    if not archhub_is_response_ok(data):
+        _, result_msg = archhub_get_result_info(data)
+        print(f"[건축HUB 경고] API 정상 응답이 아닙니다: {result_msg}")
+        return pd.DataFrame()
+
+    total_count = archhub_get_total_count(data)
+    first_items = archhub_extract_items(data)
+
+    if total_count == 0 and len(first_items) == 0:
+        if str(bjdong_cd).strip() == "" and fallback_bjdong_cd and used_bjdong_cd != fallback_bjdong_cd:
+            print(
+                f"[건축HUB 재시도] 시군구 전체 조회 결과 0건 → "
+                f"fallback bjdongCd={fallback_bjdong_cd}"
+            )
+            data, status_code = archhub_request_page(
+                sigungu_cd=sigungu_cd,
+                bjdong_cd=fallback_bjdong_cd,
+                start_date=start_date,
+                end_date=end_date,
+                page_no=1,
+                num_of_rows=num_of_rows,
+            )
+            used_bjdong_cd = fallback_bjdong_cd
+
+            if data is None or not archhub_is_response_ok(data):
+                return pd.DataFrame()
+
+            total_count = archhub_get_total_count(data)
+            first_items = archhub_extract_items(data)
+
+    total_pages = math.ceil(total_count / num_of_rows) if total_count else 1
+
+    if max_pages is not None and max_pages > 0:
+        total_pages = min(total_pages, max_pages)
+
+    print(f"[건축HUB] totalCount={total_count}, 수집 예정 페이지={total_pages}")
+
+    all_items = []
+    all_items.extend(first_items)
+
+    for page in range(2, total_pages + 1):
+        page_data, _ = archhub_request_page(
+            sigungu_cd=sigungu_cd,
+            bjdong_cd=used_bjdong_cd,
+            start_date=start_date,
+            end_date=end_date,
+            page_no=page,
+            num_of_rows=num_of_rows,
+        )
+
+        if page_data is None:
+            print(f"[건축HUB 경고] {page}페이지 수집 실패")
+            continue
+
+        all_items.extend(archhub_extract_items(page_data))
+        time.sleep(sleep_sec)
+
+    df = pd.DataFrame(all_items)
+
+    if not df.empty:
+        df["조회_sigunguCd"] = sigungu_cd
+        df["조회_bjdongCd"] = used_bjdong_cd if str(used_bjdong_cd).strip() != "" else "전체"
+        df["조회_region"] = archhub_region_from_sigungu(sigungu_cd)
+        df["조회_totalCount"] = total_count
+
+    return df
+
+
+def collect_archhub_basis_sample(
+    start_date,
+    end_date,
+    bjdong_cd="",
+    max_pages=1,
+    num_of_rows=100,
+):
+    frames = []
+
+    for label, sigungu_cd in ARCHHUB_SAMPLE_SIGUNGU_CODES.items():
+        print("\n" + "=" * 70)
+        print(f"건축HUB 샘플 지역 수집: {label} / {sigungu_cd}")
+        print("=" * 70)
+
+        try:
+            df_part = collect_archhub_basis_by_sigungu(
+                sigungu_cd=sigungu_cd,
+                bjdong_cd=bjdong_cd,
+                start_date=start_date,
+                end_date=end_date,
+                max_pages=max_pages,
+                num_of_rows=num_of_rows,
+            )
+
+            if not df_part.empty:
+                df_part["샘플지역명"] = label
+                frames.append(df_part)
+
+        except Exception as exc:
+            print(f"[건축HUB 경고] {label} 수집 실패: {exc}")
+
+        time.sleep(0.2)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True)
+
+
+def normalize_archhub_basis(df):
+    if df.empty:
+        return df
+
+    out = pd.DataFrame()
+
+    out["원천관리번호"] = get_series_or_default(
+        df,
+        ["mgmPmsrgstPk", "관리번호", "mgmNo"],
+        "",
+    )
+
+    out["원천_sigunguCd"] = get_series_or_default(
+        df,
+        ["sigunguCd", "조회_sigunguCd"],
+        "",
+    )
+
+    out["원천_bjdongCd"] = get_series_or_default(
+        df,
+        ["bjdongCd", "조회_bjdongCd"],
+        "",
+    )
+
+    out["region"] = out["원천_sigunguCd"].apply(archhub_region_from_sigungu)
+
+    out["대지위치"] = get_series_or_default(
+        df,
+        ["platPlc", "newPlatPlc", "대지위치", "siteLoc", "addr"],
+        "",
+    )
+
+    out["건물명"] = get_series_or_default(df, ["bldNm", "건물명"], "")
+    out["허가구분"] = get_series_or_default(df, ["archGbCdNm", "허가구분", "archGbNm"], "")
+    out["주용도"] = get_series_or_default(df, ["mainPurpsCdNm", "mainPurpsNm", "mainPurps", "주용도"], "")
+    out["지목"] = get_series_or_default(df, ["jimokCdNm", "지목"], "")
+    out["지역지구"] = get_series_or_default(df, ["jiyukCdNm", "지역지구"], "")
+
+    out["허가일"] = get_series_or_default(df, ["archPmsDay", "pmsDay", "허가일", "permitDay"], "").apply(parse_date_safe)
+    out["착공예정일"] = get_series_or_default(df, ["stcnsSchedDay", "착공예정일"], "").apply(parse_date_safe)
+    out["착공지연일"] = get_series_or_default(df, ["stcnsDelayDay", "착공지연일"], "").apply(parse_date_safe)
+    out["실제착공일"] = get_series_or_default(df, ["realStcnsDay", "stcnsDay", "착공일", "startDay"], "").apply(parse_date_safe)
+    out["사용승인일"] = get_series_or_default(df, ["useAprDay", "사용승인일", "useApprovalDay"], "").apply(parse_date_safe)
+    out["데이터생성일"] = get_series_or_default(df, ["crtnDay", "생성일"], "").apply(parse_date_safe)
+
+    out["대지면적"] = safe_to_numeric(get_series_or_default(df, ["platArea", "대지면적"], "0"))
+    out["건축면적"] = safe_to_numeric(get_series_or_default(df, ["archArea", "건축면적"], "0"))
+    out["연면적"] = safe_to_numeric(get_series_or_default(df, ["totArea", "totFlrArea", "연면적", "totalArea"], "0"))
+    out["용적률산정연면적"] = safe_to_numeric(get_series_or_default(df, ["vlRatEstmTotArea", "용적률산정연면적"], "0"))
+    out["건폐율"] = safe_to_numeric(get_series_or_default(df, ["bcRat", "건폐율"], "0"))
+    out["용적률"] = safe_to_numeric(get_series_or_default(df, ["vlRat", "용적률"], "0"))
+    out["주건축물수"] = safe_to_numeric(get_series_or_default(df, ["mainBldCnt", "주건축물수"], "0"))
+    out["부속건축물동수"] = safe_to_numeric(get_series_or_default(df, ["atchBldDongCnt", "부속건축물동수"], "0"))
+    out["세대수"] = safe_to_numeric(get_series_or_default(df, ["hhldCnt", "세대수"], "0"))
+    out["호수"] = safe_to_numeric(get_series_or_default(df, ["hoCnt", "호수"], "0"))
+    out["가구수"] = safe_to_numeric(get_series_or_default(df, ["fmlyCnt", "가구수"], "0"))
+    out["주차대수"] = safe_to_numeric(get_series_or_default(df, ["totPkngCnt", "주차대수"], "0"))
+    out["조회_bjdongCd"] = get_series_or_default(df, ["조회_bjdongCd"], "")
+    out["조회_totalCount"] = safe_to_numeric(get_series_or_default(df, ["조회_totalCount"], "0"))
+
+    if "샘플지역명" in df.columns:
+        out["샘플지역명"] = df["샘플지역명"]
+
+    return out
+
+
+def calc_archhub_purpose_weight(value):
+    text = str(value)
+
+    if "공동주택" in text or "아파트" in text:
+        return 1.30
+    if "업무" in text or "오피스텔" in text:
+        return 1.10
+    if "교육" in text or "연구" in text:
+        return 1.00
+    if "공장" in text:
+        return 0.90
+    if "의료" in text or "판매" in text:
+        return 0.90
+    if "근린생활" in text:
+        return 0.80
+    if "창고" in text:
+        return 0.60
+    if "단독주택" in text:
+        return 0.50
+    if "가설" in text:
+        return 0.20
+
+    return 0.80
+
+
+def classify_archhub_start_status(row):
+    if pd.notna(row.get("사용승인일")):
+        return "사용승인"
+    if pd.notna(row.get("실제착공일")):
+        return "실제착공"
+    if pd.notna(row.get("착공예정일")):
+        return "착공예정"
+    if pd.notna(row.get("허가일")):
+        return "허가"
+    return "일정미확인"
+
+
+def calc_archhub_status_weight(status):
+    if status == "실제착공":
+        return 1.20
+    if status == "착공예정":
+        return 1.10
+    if status == "허가":
+        return 1.00
+    if status == "사용승인":
+        return 0.30
+    return 0.70
+
+
+def add_archhub_demand_score(df):
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    df["착공상태"] = df.apply(classify_archhub_start_status, axis=1)
+    df["용도가중치"] = df["주용도"].apply(calc_archhub_purpose_weight)
+    df["착공상태가중치"] = df["착공상태"].apply(calc_archhub_status_weight)
+
+    df["공동주택여부"] = df["주용도"].astype(str).str.contains("공동주택|아파트", regex=True, na=False)
+    df["업무시설여부"] = df["주용도"].astype(str).str.contains("업무|오피스텔", regex=True, na=False)
+    df["공장여부"] = df["주용도"].astype(str).str.contains("공장", regex=True, na=False)
+    df["착공연계여부"] = df["착공상태"].isin(["실제착공", "착공예정"])
+    df["대형허가여부"] = df["연면적"] >= 10000
+
+    df["건축허가_선행수요지수"] = (
+        (df["연면적"] / 10000)
+        * df["용도가중치"]
+        * df["착공상태가중치"]
+    )
+
+    return df
+
+
+def make_archhub_region_summary(df):
+    if df.empty:
+        return pd.DataFrame()
+
+    summary = (
+        df.groupby("region")
+        .agg(
+            건축허가건수=("원천관리번호", "count"),
+            건축허가_연면적합계=("연면적", "sum"),
+            공동주택_연면적=("연면적", lambda s: s[df.loc[s.index, "공동주택여부"]].sum()),
+            업무시설_연면적=("연면적", lambda s: s[df.loc[s.index, "업무시설여부"]].sum()),
+            공장_연면적=("연면적", lambda s: s[df.loc[s.index, "공장여부"]].sum()),
+            착공연계_연면적=("연면적", lambda s: s[df.loc[s.index, "착공연계여부"]].sum()),
+            실제착공_연면적=("연면적", lambda s: s[df.loc[s.index, "착공상태"].eq("실제착공")].sum()),
+            착공예정_연면적=("연면적", lambda s: s[df.loc[s.index, "착공상태"].eq("착공예정")].sum()),
+            사용승인_연면적=("연면적", lambda s: s[df.loc[s.index, "착공상태"].eq("사용승인")].sum()),
+            대형허가건수=("대형허가여부", "sum"),
+            세대수합계=("세대수", "sum"),
+            건축허가_선행수요지수=("건축허가_선행수요지수", "sum"),
+        )
+        .reset_index()
+        .sort_values(by="건축허가_선행수요지수", ascending=False)
+    )
+
+    summary.insert(0, "선행수요순위", range(1, len(summary) + 1))
+
+    return summary
+
+
+def archhub_cache_files():
+    return {
+        "normalized": CACHE_PATH / "archhub_basis_normalized_latest.csv",
+        "summary": CACHE_PATH / "archhub_basis_region_summary_latest.csv",
+        "meta": CACHE_PATH / "archhub_cache_meta.json",
+    }
+
+
+def is_archhub_cache_fresh():
+    files = archhub_cache_files()
+
+    if ARCHHUB_FORCE_REFRESH:
+        return False
+
+    if not files["normalized"].exists() or not files["summary"].exists():
+        return False
+
+    modified_time = datetime.fromtimestamp(files["summary"].stat().st_mtime)
+    age_hours = (datetime.now() - modified_time).total_seconds() / 3600
+
+    return age_hours <= ARCHHUB_CACHE_HOURS
+
+
+def load_archhub_cache():
+    files = archhub_cache_files()
+
+    if not is_archhub_cache_fresh():
+        return pd.DataFrame(), pd.DataFrame()
+
+    try:
+        archhub_df = pd.read_csv(files["normalized"])
+        archhub_region_summary = pd.read_csv(files["summary"])
+        print(f"[건축HUB] 캐시 사용: {files['summary']}")
+        return archhub_df, archhub_region_summary
+    except Exception as exc:
+        print(f"[건축HUB 경고] 캐시 읽기 실패: {exc}")
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def save_archhub_cache(raw_df, archhub_df, archhub_region_summary):
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    timestamp_paths = {
+        "raw": CACHE_PATH / f"archhub_basis_raw_{now}.csv",
+        "normalized": CACHE_PATH / f"archhub_basis_normalized_{now}.csv",
+        "summary": CACHE_PATH / f"archhub_basis_region_summary_{now}.csv",
+    }
+
+    latest_paths = {
+        "raw": CACHE_PATH / "archhub_basis_raw_latest.csv",
+        "normalized": CACHE_PATH / "archhub_basis_normalized_latest.csv",
+        "summary": CACHE_PATH / "archhub_basis_region_summary_latest.csv",
+    }
+
+    raw_df.to_csv(timestamp_paths["raw"], index=False, encoding="utf-8-sig")
+    archhub_df.to_csv(timestamp_paths["normalized"], index=False, encoding="utf-8-sig")
+    archhub_region_summary.to_csv(timestamp_paths["summary"], index=False, encoding="utf-8-sig")
+
+    raw_df.to_csv(latest_paths["raw"], index=False, encoding="utf-8-sig")
+    archhub_df.to_csv(latest_paths["normalized"], index=False, encoding="utf-8-sig")
+    archhub_region_summary.to_csv(latest_paths["summary"], index=False, encoding="utf-8-sig")
+
+    meta = {
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": ARCHHUB_MODE,
+        "lookback_days": ARCHHUB_LOOKBACK_DAYS,
+        "max_pages": ARCHHUB_MAX_PAGES,
+        "raw_rows": int(len(raw_df)),
+        "normalized_rows": int(len(archhub_df)),
+        "summary_rows": int(len(archhub_region_summary)),
+    }
+
+    (CACHE_PATH / "archhub_cache_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def collect_archhub():
+    print("\n")
+    print("=" * 70)
+    print("3. 건축HUB 건축인허가 기본개요 수집 시작")
+    print("=" * 70)
+
+    if not ARCHHUB_ENABLED:
+        print("건축HUB 수집 비활성화: ARCHHUB_ENABLED=false")
+        return pd.DataFrame(), pd.DataFrame()
+
+    cached_df, cached_summary = load_archhub_cache()
+
+    if not cached_df.empty or not cached_summary.empty:
+        return cached_df, cached_summary
+
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=ARCHHUB_LOOKBACK_DAYS)).strftime("%Y%m%d")
+    max_pages = None if ARCHHUB_MAX_PAGES == 0 else ARCHHUB_MAX_PAGES
+
+    print(f"건축HUB 조회기간: {start_date} ~ {end_date}")
+    print(f"건축HUB 모드: {ARCHHUB_MODE}")
+    print(f"건축HUB 시군구별 최대 페이지: {'전체' if max_pages is None else max_pages}")
+
+    if ARCHHUB_MODE == "single":
+        raw_df = collect_archhub_basis_by_sigungu(
+            sigungu_cd=ARCHHUB_SIGUNGU_CD,
+            bjdong_cd=ARCHHUB_BJDONG_CD,
+            start_date=start_date,
+            end_date=end_date,
+            max_pages=max_pages,
+            num_of_rows=ARCHHUB_NUM_ROWS,
+        )
+    else:
+        raw_df = collect_archhub_basis_sample(
+            bjdong_cd=ARCHHUB_BJDONG_CD,
+            start_date=start_date,
+            end_date=end_date,
+            max_pages=max_pages,
+            num_of_rows=ARCHHUB_NUM_ROWS,
+        )
+
+    if raw_df.empty:
+        print("건축HUB 수집 데이터가 없습니다.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    archhub_df = normalize_archhub_basis(raw_df)
+    archhub_df = add_archhub_demand_score(archhub_df)
+    archhub_region_summary = make_archhub_region_summary(archhub_df)
+
+    save_archhub_cache(raw_df, archhub_df, archhub_region_summary)
+
+    print("건축HUB 원천 데이터 건수:", len(raw_df))
+    print("건축HUB 정규화 데이터 건수:", len(archhub_df))
+    print("건축HUB 지역 요약 건수:", len(archhub_region_summary))
+
+    return archhub_df, archhub_region_summary
 
 
 # =========================================================
@@ -1202,17 +1876,21 @@ def collect_calspia():
 # 3. 통합 수요지수 생성
 # =========================================================
 
-def make_integrated_summary(nara_region_summary, cals_demand_summary):
+def make_integrated_summary(nara_region_summary, cals_demand_summary, archhub_region_summary=None):
     print("\n")
     print("=" * 70)
-    print("3. 통합 수요지수 생성")
+    print("4. 통합 수요지수 생성")
     print("=" * 70)
 
-    if nara_region_summary.empty and cals_demand_summary.empty:
+    if archhub_region_summary is None:
+        archhub_region_summary = pd.DataFrame()
+
+    if nara_region_summary.empty and cals_demand_summary.empty and archhub_region_summary.empty:
         return pd.DataFrame()
 
     nara = nara_region_summary.copy()
     cals = cals_demand_summary.copy()
+    archhub = archhub_region_summary.copy()
 
     if not nara.empty:
         nara = nara[[
@@ -1238,18 +1916,59 @@ def make_integrated_summary(nara_region_summary, cals_demand_summary):
             "건설CALS_철근수요지수"
         ])
 
-    integrated = pd.merge(
-        cals,
-        nara,
-        on="region",
-        how="outer"
-    )
+    if not archhub.empty:
+        if "지역" in archhub.columns and "region" not in archhub.columns:
+            archhub = archhub.rename(columns={"지역": "region"})
 
+        archhub_cols = [
+            "region",
+            "건축허가건수",
+            "건축허가_연면적합계",
+            "공동주택_연면적",
+            "업무시설_연면적",
+            "착공연계_연면적",
+            "대형허가건수",
+            "세대수합계",
+            "건축허가_선행수요지수",
+        ]
+        archhub = archhub[[col for col in archhub_cols if col in archhub.columns]]
+    else:
+        archhub = pd.DataFrame(columns=[
+            "region",
+            "건축허가건수",
+            "건축허가_연면적합계",
+            "공동주택_연면적",
+            "업무시설_연면적",
+            "착공연계_연면적",
+            "대형허가건수",
+            "세대수합계",
+            "건축허가_선행수요지수",
+        ])
+
+    integrated = pd.merge(cals, nara, on="region", how="outer")
+    integrated = pd.merge(integrated, archhub, on="region", how="outer")
     integrated = integrated.fillna(0)
 
+    for col in [
+        "건설CALS_철근수요지수",
+        "나라장터_철근관련입찰건수",
+        "나라장터_추정가격합계",
+        "건축허가건수",
+        "건축허가_연면적합계",
+        "공동주택_연면적",
+        "업무시설_연면적",
+        "착공연계_연면적",
+        "대형허가건수",
+        "세대수합계",
+        "건축허가_선행수요지수",
+    ]:
+        if col not in integrated.columns:
+            integrated[col] = 0
+
     integrated["통합수요지수"] = (
-        integrated["건설CALS_철근수요지수"]
+        integrated["건설CALS_철근수요지수"] * 1.0
         + integrated["나라장터_철근관련입찰건수"] * 1.5
+        + integrated["건축허가_선행수요지수"] * 0.8
     )
 
     integrated["수요등급"] = pd.cut(
@@ -1267,19 +1986,34 @@ def make_integrated_summary(nara_region_summary, cals_demand_summary):
         axis=1
     )
 
+    integrated["건축허가비중"] = integrated.apply(
+        lambda row: (
+            row["건축허가_선행수요지수"] * 0.8 / row["통합수요지수"]
+            if row["통합수요지수"] > 0
+            else 0
+        ),
+        axis=1
+    )
+
     def recommend_integrated_action(row):
         grade = str(row.get("수요등급", ""))
         nara_count = float(row.get("나라장터_철근관련입찰건수", 0))
         cals_index = float(row.get("건설CALS_철근수요지수", 0))
+        archhub_index = float(row.get("건축허가_선행수요지수", 0))
+        arch_area = float(row.get("건축허가_연면적합계", 0))
 
         if grade == "매우 높음" and nara_count >= 5:
-            return "최우선 공략: 신규 입찰·진행공사 동시 확인"
+            return "최우선 공략: 신규 입찰·진행공사·건축허가 동시 확인"
+        if grade in ["매우 높음", "높음"] and archhub_index >= 20 and arch_area >= 100000:
+            return "건축허가 선행수요 확인: 민간·건축 현장 모니터링"
         if grade in ["매우 높음", "높음"] and cals_index >= 15:
             return "진행공사 기반 수요처/현장 추적"
         if grade in ["매우 높음", "높음"]:
             return "입찰 공고 중심 단기 모니터링"
         if nara_count > 0:
             return "철근 관련 공고 발생 시 추적"
+        if archhub_index > 0:
+            return "건축허가 추세 정기 모니터링"
         return "정기 모니터링"
 
     integrated["권장영업액션"] = integrated.apply(recommend_integrated_action, axis=1)
@@ -1364,7 +2098,58 @@ def rename_columns_korean(df):
         "통합수요지수": "통합 수요지수",
         "수요등급": "수요등급",
         "신규입찰비중": "신규입찰비중",
+        "건축허가비중": "건축허가비중",
         "후속수요관점": "후속수요관점",
+
+        # 건축HUB
+        "원천관리번호": "원천관리번호",
+        "원천_sigunguCd": "시군구코드",
+        "원천_bjdongCd": "법정동코드",
+        "대지위치": "대지위치",
+        "건물명": "건물명",
+        "허가구분": "허가구분",
+        "주용도": "주용도",
+        "지목": "지목",
+        "지역지구": "지역지구",
+        "허가일": "허가일",
+        "착공예정일": "착공예정일",
+        "착공지연일": "착공지연일",
+        "실제착공일": "실제착공일",
+        "사용승인일": "사용승인일",
+        "데이터생성일": "데이터생성일",
+        "대지면적": "대지면적",
+        "건축면적": "건축면적",
+        "연면적": "연면적",
+        "용적률산정연면적": "용적률산정연면적",
+        "건폐율": "건폐율",
+        "용적률": "용적률",
+        "주건축물수": "주건축물수",
+        "부속건축물동수": "부속건축물동수",
+        "세대수": "세대수",
+        "호수": "호수",
+        "가구수": "가구수",
+        "주차대수": "주차대수",
+        "착공상태": "착공상태",
+        "용도가중치": "용도가중치",
+        "착공상태가중치": "착공상태가중치",
+        "공동주택여부": "공동주택여부",
+        "업무시설여부": "업무시설여부",
+        "공장여부": "공장여부",
+        "착공연계여부": "착공연계여부",
+        "대형허가여부": "대형허가여부",
+        "건축허가_선행수요지수": "건축허가 선행수요지수",
+        "선행수요순위": "선행수요순위",
+        "건축허가건수": "건축허가 건수",
+        "건축허가_연면적합계": "건축허가 연면적 합계",
+        "공동주택_연면적": "공동주택 연면적",
+        "업무시설_연면적": "업무시설 연면적",
+        "공장_연면적": "공장 연면적",
+        "착공연계_연면적": "착공연계 연면적",
+        "실제착공_연면적": "실제착공 연면적",
+        "착공예정_연면적": "착공예정 연면적",
+        "사용승인_연면적": "사용승인 연면적",
+        "대형허가건수": "대형허가 건수",
+        "세대수합계": "세대수 합계",
 
         # 날짜/긴급도
         "공고일_변환": "공고일",
@@ -1425,6 +2210,9 @@ def format_worksheet(writer, sheet_name, df, group_type):
     elif group_type == "integrated":
         tab_color = "#9DC3E6"
         header_color = "#1F4E78"
+    elif group_type == "archhub":
+        tab_color = "#D9EAD3"
+        header_color = "#38761D"
     else:
         tab_color = "#D9EAD3"
         header_color = "#666666"
@@ -1480,7 +2268,7 @@ def format_worksheet(writer, sheet_name, df, group_type):
 
         width = min(max(max_len + 2, 10), 38)
 
-        if "공고명" in col or "공사명" in col:
+        if "공고명" in col or "공사명" in col or "대지위치" in col:
             width = 45
         elif "기관" in col:
             width = 28
@@ -1623,7 +2411,9 @@ def write_summary_sheet(
     nara_region_summary,
     cals_df,
     cals_demand_summary,
-    integrated_summary
+    integrated_summary,
+    archhub_df=None,
+    archhub_region_summary=None
 ):
     workbook = writer.book
     worksheet = workbook.add_worksheet("요약")
@@ -1698,6 +2488,15 @@ def write_summary_sheet(
         if "추정가격_숫자" in nara_steel_df.columns:
             estimated_total = nara_steel_df["추정가격_숫자"].sum()
 
+    archhub_count = safe_len(archhub_df)
+    archhub_top_region = "데이터 없음"
+    archhub_area_total = 0
+
+    if archhub_region_summary is not None and not archhub_region_summary.empty:
+        archhub_top_region = get_top_region(archhub_region_summary)
+        if "건축허가_연면적합계" in archhub_region_summary.columns:
+            archhub_area_total = archhub_region_summary["건축허가_연면적합계"].sum()
+
     summary_rows = [
         ["리포트 생성일", report_time],
         ["나라장터 전체 입찰공고 수", safe_len(nara_df)],
@@ -1706,7 +2505,10 @@ def write_summary_sheet(
         ["A/B 우선 검토 입찰 수", int(priority_count)],
         ["철근 관련 추정가격 합계", int(estimated_total)],
         ["건설CALS 진행공사 수", safe_len(cals_df)],
+        ["건축HUB 인허가 수", int(archhub_count)],
+        ["건축HUB 연면적 합계", int(archhub_area_total)],
         ["통합 수요 1위 지역", get_top_region(integrated_summary)],
+        ["건축허가 선행수요 1위", archhub_top_region],
         ["최다 매칭 키워드", get_top_keyword(keyword_summary)],
     ]
 
@@ -1729,14 +2531,16 @@ def write_summary_sheet(
     cals_count = safe_len(cals_df)
 
     summary_text = (
-        f"이번 리포트는 나라장터 공사입찰을 선행 수요, 건설CALS 진행공사를 현재 수요로 보고 "
-        f"지역별 철근 수요 가능성과 영업 우선순위를 통합한 자료입니다.\n\n"
-        f"현재 철근 관련 입찰은 {nara_steel_count:,}건이며, 이 중 긴급 또는 매우 긴급으로 분류된 공고는 "
+        f"이번 리포트는 나라장터 공사입찰, 건설CALS 진행공사, 건축HUB 건축인허가 데이터를 통합해 "
+        f"지역별 철근 수요 가능성과 영업 우선순위를 산정한 자료입니다.\n\n"
+        f"나라장터는 단기 입찰 수요, CALS는 현재 진행공사 수요, 건축HUB는 향후 착공 가능성이 있는 "
+        f"건축 부문 선행수요로 해석합니다.\n\n"
+        f"현재 철근 관련 입찰은 {nara_steel_count:,}건이며, 긴급 또는 매우 긴급 공고는 "
         f"{int(urgent_count):,}건입니다. A/B 우선 검토 대상은 {int(priority_count):,}건입니다.\n\n"
-        f"통합 수요지수 기준 최우선 지역은 '{top_region}'입니다. 해당 지역은 진행공사 규모와 신규 입찰 흐름을 함께 확인하고, "
-        f"상위 수요기관·공고기관을 중심으로 공고문, 규격, 납기, 현장 규모를 우선 점검하는 것이 좋습니다.\n\n"
-        f"최다 매칭 키워드는 '{top_keyword}'입니다. 키워드는 실제 철근 소요량 확정값이 아니라 탐색 신호이므로, "
-        f"대형 공사·구조물 공사·토목 공사 여부를 공고문에서 추가 확인해야 합니다."
+        f"건축HUB 인허가 데이터는 {archhub_count:,}건이며, 표본 기준 건축허가 선행수요 1위 지역은 "
+        f"'{archhub_top_region}'입니다.\n\n"
+        f"통합 수요지수 기준 최우선 지역은 '{top_region}'입니다. 해당 지역은 입찰 공고, 진행공사, 건축허가 흐름을 "
+        f"같이 확인하고 공고문·규격·납기·현장 규모를 우선 점검하는 것이 좋습니다."
     )
 
     worksheet.merge_range("D5:H12", summary_text, text_format)
@@ -1753,7 +2557,9 @@ def write_summary_sheet(
             "수요등급",
             "나라장터_철근관련입찰건수",
             "건설CALS_철근수요지수",
-            "신규입찰비중",
+            "건축허가_선행수요지수",
+            "건축허가_연면적합계",
+            "건축허가비중",
             "권장영업액션",
         ]
         top5 = top5[[col for col in top5_cols if col in top5.columns]]
@@ -1766,7 +2572,7 @@ def write_summary_sheet(
         for row_idx, (_, row) in enumerate(top5.iterrows(), start=15):
             for col_idx, header in enumerate(headers[:8]):
                 cell_format = value_format if isinstance(row[header], Number) else text_format
-                if header == "신규입찰비중":
+                if header in ["신규입찰비중", "건축허가비중"]:
                     cell_format = percent_format
                 worksheet.write(
                     row_idx,
@@ -1824,7 +2630,9 @@ def export_integrated_excel_report(
     cals_region_field_summary,
     cals_agency_summary,
     cals_demand_summary,
-    integrated_summary
+    integrated_summary,
+    archhub_df=None,
+    archhub_region_summary=None
 ):
     nara_df_kr = rename_columns_korean(nara_df.copy())
     nara_steel_df_kr = rename_columns_korean(nara_steel_df.copy())
@@ -1838,6 +2646,14 @@ def export_integrated_excel_report(
     cals_agency_summary_kr = rename_columns_korean(cals_agency_summary.copy())
     cals_demand_summary_kr = rename_columns_korean(cals_demand_summary.copy())
 
+    if archhub_df is None:
+        archhub_df = pd.DataFrame()
+    if archhub_region_summary is None:
+        archhub_region_summary = pd.DataFrame()
+
+    archhub_df_kr = rename_columns_korean(archhub_df.copy())
+    archhub_region_summary_kr = rename_columns_korean(archhub_region_summary.copy())
+
     integrated_summary_kr = rename_columns_korean(integrated_summary.copy())
 
     with pd.ExcelWriter(excel_file, engine="xlsxwriter") as writer:
@@ -1850,10 +2666,14 @@ def export_integrated_excel_report(
             nara_region_summary,
             cals_df,
             cals_demand_summary,
-            integrated_summary
+            integrated_summary,
+            archhub_df=archhub_df,
+            archhub_region_summary=archhub_region_summary
         )
 
         integrated_summary_kr.to_excel(writer, sheet_name="통합_수요지수", index=False)
+        archhub_region_summary_kr.to_excel(writer, sheet_name="건축HUB_선행수요", index=False)
+        archhub_df_kr.to_excel(writer, sheet_name="건축HUB_원천", index=False)
 
         nara_steel_df_kr.to_excel(writer, sheet_name="나라장터_철근입찰", index=False)
         nara_region_summary_kr.to_excel(writer, sheet_name="나라장터_지역별", index=False)
@@ -1869,6 +2689,8 @@ def export_integrated_excel_report(
         nara_df_kr.to_excel(writer, sheet_name="나라장터_전체입찰", index=False)
 
         format_worksheet(writer, "통합_수요지수", integrated_summary_kr, "integrated")
+        format_worksheet(writer, "건축HUB_선행수요", archhub_region_summary_kr, "archhub")
+        format_worksheet(writer, "건축HUB_원천", archhub_df_kr, "archhub")
         format_worksheet(writer, "나라장터_전체입찰", nara_df_kr, "nara")
         format_worksheet(writer, "나라장터_철근입찰", nara_steel_df_kr, "nara")
         format_worksheet(writer, "나라장터_키워드", keyword_summary_kr, "nara")
@@ -1892,9 +2714,18 @@ if __name__ == "__main__":
 
     cals_df, cals_region_summary, cals_region_field_summary, cals_agency_summary, cals_demand_summary = collect_calspia()
 
+    try:
+        archhub_df, archhub_region_summary = collect_archhub()
+    except Exception as exc:
+        print("[건축HUB 경고] 수집 중 오류가 발생하여 건축HUB 없이 리포트를 생성합니다.")
+        print(exc)
+        archhub_df = pd.DataFrame()
+        archhub_region_summary = pd.DataFrame()
+
     integrated_summary = make_integrated_summary(
         nara_region_summary,
-        cals_demand_summary
+        cals_demand_summary,
+        archhub_region_summary
     )
 
     excel_file = os.path.join(
@@ -1914,7 +2745,9 @@ if __name__ == "__main__":
         cals_region_field_summary=cals_region_field_summary,
         cals_agency_summary=cals_agency_summary,
         cals_demand_summary=cals_demand_summary,
-        integrated_summary=integrated_summary
+        integrated_summary=integrated_summary,
+        archhub_df=archhub_df,
+        archhub_region_summary=archhub_region_summary
     )
 
     print("\n")
