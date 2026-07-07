@@ -1,5 +1,31 @@
+# 환경변수 / 가상환경
 .env
-data/
+.venv/
 __pycache__/
+*.pyc
+
+# 생성 엑셀 파일은 업로드 금지
 *.xlsx
+data/processed/
+
+# CSV는 기본적으로 무시
 *.csv
+
+# data 폴더 자체는 허용
+!data/
+!data/reference/
+!data/cache/
+
+# 기준 법정동 코드 파일은 허용
+!data/reference/bjdong_codes_for_archhub.csv
+
+# cache 폴더 안 파일은 기본적으로 무시
+data/cache/*
+
+# 단, Streamlit에서 필요한 건축HUB cache만 허용
+!data/cache/archhub_basis_region_summary_latest.csv
+!data/cache/archhub_basis_normalized_latest.csv
+!data/cache/archhub_cache_meta.json
+
+# raw cache는 업로드 금지
+data/cache/archhub_basis_raw*
