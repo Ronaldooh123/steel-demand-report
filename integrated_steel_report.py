@@ -2,6 +2,7 @@ import os
 import math
 import time
 import json
+import re
 import requests
 import urllib3
 import pandas as pd
@@ -1710,53 +1711,148 @@ def collect_calspia():
     print("2. 건설CALS 진행공사 수집 시작")
     print("=" * 70)
 
-    base_url = "https://www.calspia.go.kr/io/openapi/cm/selectIoCmConstructionList.do"
+    # CALS는 외부 클라우드/Streamlit Cloud 환경에서 간헐적으로 연결 지연이 발생할 수 있어
+    # 단일 요청 실패로 전체 리포트가 중단되지 않도록 재시도 로직을 둡니다.
+    base_urls = [
+        "https://www.calspia.go.kr/io/openapi/cm/selectIoCmConstructionList.do",
+        # HTTPS 연결이 일시적으로 불안정할 때를 대비한 보조 후보입니다.
+        # 서버 정책에 따라 HTTP가 차단될 수 있으며, 이 경우 자동으로 다음 재시도에서 무시됩니다.
+        "http://www.calspia.go.kr/io/openapi/cm/selectIoCmConstructionList.do",
+    ]
 
-    num_of_rows = 100
+    num_of_rows = int(os.getenv("CALS_NUM_ROWS", "100"))
+    connect_timeout = int(os.getenv("CALS_CONNECT_TIMEOUT", "15"))
+    read_timeout = int(os.getenv("CALS_READ_TIMEOUT", "60"))
+    max_retries = int(os.getenv("CALS_MAX_RETRIES", "3"))
+    backoff_sec = float(os.getenv("CALS_BACKOFF_SEC", "2.0"))
+    max_pages_limit = int(os.getenv("CALS_MAX_PAGES", "0"))  # 0이면 전체 페이지
+
     all_items = []
 
-    first_params = {
-        "serviceKey": cals_api_key,
-        "type": "json",
-        "pageNo": 1,
-        "numOfRows": num_of_rows
-    }
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (compatible; steel-demand-report/1.0; "
+            "+https://github.com/Ronaldooh123/steel-demand-report)"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Connection": "close",
+    })
 
-    response = requests.get(
-        base_url,
-        params=first_params,
-        timeout=30,
-        verify=False
-    )
+    def mask_sensitive(text_value):
+        text_value = str(text_value)
+        text_value = re.sub(r"(serviceKey=)[^&\s]+", r"\1***", text_value)
+        text_value = re.sub(r"(serviceKey%3D)[^&\s]+", r"\1***", text_value)
+        return text_value
 
-    print("건설CALS 상태코드:", response.status_code)
+    def request_cals_page(page_no):
+        params = {
+            "serviceKey": cals_api_key,
+            "type": "json",
+            "pageNo": page_no,
+            "numOfRows": num_of_rows,
+        }
 
-    data = response.json()
+        last_error = None
 
-    body = data["response"]["body"]
+        for base_url in base_urls:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = session.get(
+                        base_url,
+                        params=params,
+                        timeout=(connect_timeout, read_timeout),
+                        verify=False,
+                    )
+
+                    print(
+                        f"건설CALS page={page_no} "
+                        f"status={response.status_code} "
+                        f"attempt={attempt}/{max_retries}"
+                    )
+
+                    # 서버가 일시적으로 불안정한 경우 재시도합니다.
+                    if response.status_code in [429, 500, 502, 503, 504]:
+                        last_error = RuntimeError(f"HTTP {response.status_code}")
+                        time.sleep(backoff_sec * attempt)
+                        continue
+
+                    response.raise_for_status()
+
+                    try:
+                        data = response.json()
+                    except Exception as exc:
+                        preview = mask_sensitive((response.text or "")[:300])
+                        raise RuntimeError(
+                            f"CALS JSON 변환 실패: {type(exc).__name__}, 응답앞부분={preview}"
+                        ) from exc
+
+                    if not isinstance(data, dict) or "response" not in data:
+                        preview = mask_sensitive(str(data)[:300])
+                        raise RuntimeError(f"CALS 응답 구조 이상: {preview}")
+
+                    return data
+
+                except requests.exceptions.ConnectTimeout as exc:
+                    last_error = exc
+                    print(
+                        f"[건설CALS 재시도] 연결 시간초과 "
+                        f"page={page_no}, attempt={attempt}/{max_retries}"
+                    )
+                    time.sleep(backoff_sec * attempt)
+
+                except requests.exceptions.ReadTimeout as exc:
+                    last_error = exc
+                    print(
+                        f"[건설CALS 재시도] 응답 읽기 시간초과 "
+                        f"page={page_no}, attempt={attempt}/{max_retries}"
+                    )
+                    time.sleep(backoff_sec * attempt)
+
+                except requests.exceptions.RequestException as exc:
+                    last_error = exc
+                    print(
+                        f"[건설CALS 재시도] 요청 오류 "
+                        f"page={page_no}, type={type(exc).__name__}, attempt={attempt}/{max_retries}"
+                    )
+                    time.sleep(backoff_sec * attempt)
+
+                except Exception as exc:
+                    # JSON 파싱/응답 구조 문제는 네트워크 문제가 아닐 수 있으므로 즉시 중단합니다.
+                    raise RuntimeError(mask_sensitive(str(exc))) from exc
+
+        error_type = type(last_error).__name__ if last_error is not None else "UnknownError"
+        error_msg = mask_sensitive(str(last_error))[:500] if last_error is not None else "원인 미상"
+        raise RuntimeError(
+            f"건설CALS API 연결 실패 page={page_no}, "
+            f"error_type={error_type}, error={error_msg}"
+        )
+
+    first_data = request_cals_page(1)
+
+    body = first_data.get("response", {}).get("body", {})
     total_count = int(body.get("totalCount", 0))
-    total_pages = math.ceil(total_count / num_of_rows)
+    total_pages = math.ceil(total_count / num_of_rows) if total_count else 1
+
+    if max_pages_limit > 0:
+        total_pages = min(total_pages, max_pages_limit)
 
     print("건설CALS 전체 공사 건수:", total_count)
     print("건설CALS 전체 페이지 수:", total_pages)
 
-    for page in range(1, total_pages + 1):
-        params = {
-            "serviceKey": cals_api_key,
-            "type": "json",
-            "pageNo": page,
-            "numOfRows": num_of_rows
-        }
+    first_items = body.get("items", [])
 
-        response = requests.get(
-            base_url,
-            params=params,
-            timeout=30,
-            verify=False
-        )
+    if isinstance(first_items, dict):
+        first_items = [first_items]
 
-        data = response.json()
-        items = data["response"]["body"].get("items", [])
+    if first_items:
+        all_items.extend(first_items)
+
+    print(f"건설CALS 1/{total_pages} 페이지 수집 완료 - 누적 {len(all_items)}건")
+
+    for page in range(2, total_pages + 1):
+        data = request_cals_page(page)
+        items = data.get("response", {}).get("body", {}).get("items", [])
 
         if isinstance(items, dict):
             items = [items]
@@ -2717,7 +2813,9 @@ if __name__ == "__main__":
     except Exception as exc:
         print("[건설CALS 경고] 수집 중 오류가 발생하여 CALS 없이 리포트를 생성합니다.")
         print("[건설CALS 경고] Streamlit Cloud 또는 외부망에서 CALS 서버 접속이 지연/차단될 수 있습니다.")
-        print(exc)
+        safe_error = re.sub(r"(serviceKey=)[^&\s]+", r"\1***", str(exc))
+        print(f"[건설CALS 경고] 오류유형: {type(exc).__name__}")
+        print(f"[건설CALS 경고] 오류요약: {safe_error[:500]}")
 
         cals_df = pd.DataFrame()
         cals_region_summary = pd.DataFrame(columns=[
