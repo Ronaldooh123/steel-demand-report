@@ -2712,7 +2712,36 @@ if __name__ == "__main__":
 
     nara_df, nara_steel_df, keyword_summary, nara_agency_summary, nara_region_summary = collect_narajangteo()
 
-    cals_df, cals_region_summary, cals_region_field_summary, cals_agency_summary, cals_demand_summary = collect_calspia()
+    try:
+        cals_df, cals_region_summary, cals_region_field_summary, cals_agency_summary, cals_demand_summary = collect_calspia()
+    except Exception as exc:
+        print("[건설CALS 경고] 수집 중 오류가 발생하여 CALS 없이 리포트를 생성합니다.")
+        print("[건설CALS 경고] Streamlit Cloud 또는 외부망에서 CALS 서버 접속이 지연/차단될 수 있습니다.")
+        print(exc)
+
+        cals_df = pd.DataFrame()
+        cals_region_summary = pd.DataFrame(columns=[
+            "순위",
+            "region",
+            "건설CALS_진행공사건수",
+        ])
+        cals_region_field_summary = pd.DataFrame(columns=[
+            "region",
+            "bzarNm",
+            "공사건수",
+            "철근가중치",
+            "건설CALS_철근수요지수",
+        ])
+        cals_agency_summary = pd.DataFrame(columns=[
+            "순위",
+            "ornm",
+            "진행공사건수",
+        ])
+        cals_demand_summary = pd.DataFrame(columns=[
+            "수요순위",
+            "region",
+            "건설CALS_철근수요지수",
+        ])
 
     try:
         archhub_df, archhub_region_summary = collect_archhub()
