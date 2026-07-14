@@ -1,22 +1,22 @@
 {
-  "created_at": "2026-07-13 20:34:37",
+  "created_at": "2026-07-14 19:39:25",
   "mode": "priority",
-  "raw_rows": 7259,
-  "normalized_rows": 7259,
+  "raw_rows": 10236,
+  "normalized_rows": 10236,
   "region_summary_rows": 17,
   "sigungu_summary_rows": 29,
   "attempted_rows": 850,
   "reference_rows": 850,
   "files": {
-    "raw_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_raw_20260713_203436.csv",
-    "normalized_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_normalized_20260713_203436.csv",
-    "region_summary_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_region_summary_20260713_203436.csv",
+    "raw_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_raw_20260714_193924.csv",
+    "normalized_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_normalized_20260714_193924.csv",
+    "region_summary_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_region_summary_20260714_193924.csv",
     "raw_latest": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_raw_latest.csv",
     "normalized_latest": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_normalized_latest.csv",
     "region_summary_latest": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_region_summary_latest.csv",
-    "sigungu_summary_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_sigungu_summary_20260713_203436.csv",
+    "sigungu_summary_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_sigungu_summary_20260714_193924.csv",
     "sigungu_summary_latest": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_basis_sigungu_summary_latest.csv",
-    "attempted_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_national_attempted_pairs_20260713_203436.csv",
+    "attempted_timestamp": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_national_attempted_pairs_20260714_193924.csv",
     "attempted_latest": "/home/runner/work/steel-demand-report/steel-demand-report/data/cache/archhub_national_attempted_pairs_latest.csv"
   }
 }
