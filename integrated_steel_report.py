@@ -1477,40 +1477,104 @@ def collect_narajangteo():
     print("1. 나라장터 공사입찰 수집 시작")
     print("=" * 70)
 
-    base_url = (
-        "http://apis.data.go.kr/1230000/ad/"
-        "BidPublicInfoService/getBidPblancListInfoCnstwk"
-    )
+    # 나라장터도 Streamlit/GitHub Actions 같은 클라우드 환경에서 간헐적으로
+    # read timeout이 발생할 수 있어 CALS와 동일하게 재시도 로직을 둡니다.
+    base_urls = [
+        "http://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoCnstwk",
+        "https://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoCnstwk",
+    ]
 
-    num_of_rows = 100
-    all_items = []
+    num_of_rows = int(os.getenv("NARA_NUM_ROWS", "100"))
+    connect_timeout = int(os.getenv("NARA_CONNECT_TIMEOUT", "15"))
+    read_timeout = int(os.getenv("NARA_READ_TIMEOUT", "90"))
+    max_retries = int(os.getenv("NARA_MAX_RETRIES", "5"))
+    backoff_sec = float(os.getenv("NARA_BACKOFF_SEC", "2.0"))
+    max_pages_limit = int(os.getenv("NARA_MAX_PAGES", "0"))  # 0이면 전체 페이지
 
     end_date = datetime.now()
     start_date = end_date - timedelta(days=NARA_LOOKBACK_DAYS)
 
-    first_params = {
-        "serviceKey": nara_api_key,
-        "pageNo": "1",
-        "numOfRows": str(num_of_rows),
-        "inqryDiv": "1",
-        "inqryBgnDt": start_date.strftime("%Y%m%d0000"),
-        "inqryEndDt": end_date.strftime("%Y%m%d2359"),
-        "type": "json"
-    }
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Connection": "close",
+    })
 
-    response = requests.get(
-        base_url,
-        params=first_params,
-        timeout=30,
-        verify=False
-    )
+    def mask_error(value):
+        return re.sub(r"(serviceKey=)[^&\s]+", r"\1***", str(value))
 
-    print("나라장터 상태코드:", response.status_code)
+    def get_nara_page(page_no):
+        params = {
+            "serviceKey": nara_api_key,
+            "pageNo": str(page_no),
+            "numOfRows": str(num_of_rows),
+            "inqryDiv": "1",
+            "inqryBgnDt": start_date.strftime("%Y%m%d0000"),
+            "inqryEndDt": end_date.strftime("%Y%m%d2359"),
+            "type": "json",
+        }
 
-    data = response.json()
+        last_error = None
 
-    result_code = data["response"]["header"].get("resultCode")
-    result_msg = data["response"]["header"].get("resultMsg")
+        for base_url in base_urls:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = session.get(
+                        base_url,
+                        params=params,
+                        timeout=(connect_timeout, read_timeout),
+                        verify=False,
+                    )
+
+                    print(
+                        f"나라장터 page={page_no} status={response.status_code} "
+                        f"attempt={attempt}/{max_retries}"
+                    )
+
+                    if response.status_code in [429, 500, 502, 503, 504]:
+                        last_error = RuntimeError(
+                            f"나라장터 일시 오류 status={response.status_code}, body={response.text[:300]}"
+                        )
+                        time.sleep(backoff_sec * attempt)
+                        continue
+
+                    response.raise_for_status()
+
+                    try:
+                        return response.json()
+                    except Exception as exc:
+                        preview = (response.text or "")[:500]
+                        raise ValueError(f"나라장터 JSON 변환 실패: {preview}") from exc
+
+                except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout) as exc:
+                    last_error = exc
+                    print(
+                        f"[나라장터 재시도] 시간초과 page={page_no}, "
+                        f"attempt={attempt}/{max_retries}"
+                    )
+                    time.sleep(backoff_sec * attempt)
+
+                except requests.exceptions.RequestException as exc:
+                    last_error = exc
+                    print(
+                        f"[나라장터 재시도] 요청 오류 page={page_no}, "
+                        f"attempt={attempt}/{max_retries}, error={type(exc).__name__}"
+                    )
+                    time.sleep(backoff_sec * attempt)
+
+        raise RuntimeError(
+            f"나라장터 API 연결 실패 page={page_no}, "
+            f"error_type={type(last_error).__name__}, error={mask_error(last_error)}"
+        )
+
+    first_data = get_nara_page(1)
+
+    result_code = first_data["response"]["header"].get("resultCode")
+    result_msg = first_data["response"]["header"].get("resultMsg")
 
     print("나라장터 응답코드:", result_code)
     print("나라장터 응답메시지:", result_msg)
@@ -1518,36 +1582,36 @@ def collect_narajangteo():
     if result_code != "00":
         raise ValueError(f"나라장터 API 오류: {result_msg}")
 
-    body = data["response"]["body"]
+    body = first_data["response"]["body"]
     total_count = int(body.get("totalCount", 0))
-    total_pages = math.ceil(total_count / num_of_rows)
+    total_pages = math.ceil(total_count / num_of_rows) if total_count else 1
+
+    if max_pages_limit > 0:
+        total_pages = min(total_pages, max_pages_limit)
 
     print("나라장터 전체 입찰 건수:", total_count)
     print("나라장터 전체 페이지 수:", total_pages)
 
-    for page in range(1, total_pages + 1):
-        params = {
-            "serviceKey": nara_api_key,
-            "pageNo": str(page),
-            "numOfRows": str(num_of_rows),
-            "inqryDiv": "1",
-            "inqryBgnDt": start_date.strftime("%Y%m%d0000"),
-            "inqryEndDt": end_date.strftime("%Y%m%d2359"),
-            "type": "json"
-        }
+    all_items = []
 
-        response = requests.get(
-            base_url,
-            params=params,
-            timeout=30,
-            verify=False
-        )
+    first_items = body.get("items", [])
+    if isinstance(first_items, dict):
+        first_items = [first_items]
+    if first_items is None:
+        first_items = []
 
-        data = response.json()
+    all_items.extend(first_items)
+    print(f"나라장터 1/{total_pages} 페이지 수집 완료 - 누적 {len(all_items)}건")
+
+    for page in range(2, total_pages + 1):
+        data = get_nara_page(page)
         items = data["response"]["body"].get("items", [])
 
         if isinstance(items, dict):
             items = [items]
+
+        if items is None:
+            items = []
 
         all_items.extend(items)
 
@@ -2806,7 +2870,25 @@ def export_integrated_excel_report(
 
 if __name__ == "__main__":
 
-    nara_df, nara_steel_df, keyword_summary, nara_agency_summary, nara_region_summary = collect_narajangteo()
+    try:
+        nara_df, nara_steel_df, keyword_summary, nara_agency_summary, nara_region_summary = collect_narajangteo()
+    except Exception as exc:
+        print("[나라장터 경고] 수집 중 오류가 발생하여 나라장터 없이 리포트를 생성합니다.")
+        print("[나라장터 경고] Streamlit Cloud 또는 GitHub Actions에서 공공데이터포털 접속이 지연될 수 있습니다.")
+        safe_error = re.sub(r"(serviceKey=)[^&\s]+", r"\1***", str(exc))
+        print(f"[나라장터 경고] 오류유형: {type(exc).__name__}")
+        print(f"[나라장터 경고] 오류요약: {safe_error[:500]}")
+
+        nara_df = pd.DataFrame()
+        nara_steel_df = pd.DataFrame()
+        keyword_summary = pd.DataFrame(columns=["순위", "키워드", "입찰건수"])
+        nara_agency_summary = pd.DataFrame(columns=["순위", "dminsttNm", "철근관련입찰건수"])
+        nara_region_summary = pd.DataFrame(columns=[
+            "순위",
+            "region",
+            "나라장터_철근관련입찰건수",
+            "나라장터_추정가격합계",
+        ])
 
     try:
         cals_df, cals_region_summary, cals_region_field_summary, cals_agency_summary, cals_demand_summary = collect_calspia()
