@@ -2,6 +2,7 @@ name: Generate steel demand report
 
 on:
   workflow_dispatch:
+
   schedule:
     # 매일 새벽 4시 KST = 전날 19시 UTC
     - cron: "0 19 * * *"
@@ -9,16 +10,26 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: generate-steel-report
+  cancel-in-progress: false
+
 jobs:
   generate-steel-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+
+    # 기존 120분에서 240분으로 확대
+    timeout-minutes: 240
+
+    env:
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,35 +46,105 @@ jobs:
           mkdir -p data/cache
           mkdir -p data/processed
           mkdir -p data/reference
+          mkdir -p logs
 
       - name: Check reference file
         run: |
           test -f data/reference/bjdong_codes_for_archhub.csv
 
+      # 실행 전 캐시가 실제로 존재하는지 로그에 표시
+      - name: Inspect existing cache
+        run: |
+          echo "===== CACHE BEFORE UPDATE ====="
+          find data/cache -maxdepth 1 -type f \
+            -printf "%TY-%Tm-%Td %TH:%TM  %10s bytes  %p\n" \
+            | sort || true
+
+          echo "===== CACHE META ====="
+          if [ -f data/cache/archhub_cache_meta.json ]; then
+            cat data/cache/archhub_cache_meta.json
+          else
+            echo "archhub_cache_meta.json not found"
+          fi
+
       - name: Update ArchHUB priority cache
         env:
           NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
           ARCHHUB_API_KEY: ${{ secrets.ARCHHUB_API_KEY }}
+
+          # 최신 데이터로 매일 강제 갱신하려면 true 유지
           ARCHHUB_FORCE_REFRESH: "true"
+
+        timeout-minutes: 40
+
         run: |
-          python collect_archhub.py --mode priority --max-per-region 50 --max-pages 1
+          set -o pipefail
+
+          python -u collect_archhub.py \
+            --mode priority \
+            --max-per-region 50 \
+            --max-pages 1 \
+            2>&1 | tee logs/archhub_update.log
+
+      # 캐시 생성 여부 즉시 확인
+      - name: Verify ArchHUB cache
+        run: |
+          echo "===== CACHE AFTER UPDATE ====="
+
+          find data/cache -maxdepth 1 -type f \
+            -printf "%TY-%Tm-%Td %TH:%TM  %10s bytes  %p\n" \
+            | sort
+
+          test -s data/cache/archhub_basis_region_summary_latest.csv
+          test -s data/cache/archhub_basis_normalized_latest.csv
+          test -s data/cache/archhub_cache_meta.json
+
+      # 보고서 작업 전에 캐시부터 저장
+      - name: Commit ArchHUB cache first
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add -f data/cache/archhub_basis_region_summary_latest.csv
+          git add -f data/cache/archhub_basis_normalized_latest.csv
+          git add -f data/cache/archhub_cache_meta.json
+
+          if git diff --cached --quiet; then
+            echo "No ArchHUB cache changes"
+          else
+            git commit -m "Update ArchHUB cache"
+            git push
+          fi
 
       - name: Generate integrated Excel report
+        timeout-minutes: 170
+
         env:
           NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
           CALS_API_KEY: ${{ secrets.CALS_API_KEY }}
           ARCHHUB_API_KEY: ${{ secrets.ARCHHUB_API_KEY }}
 
+          # 방금 생성한 캐시를 사용
           ARCHHUB_CACHE_HOURS: "9999"
           ARCHHUB_FORCE_REFRESH: "false"
 
-          CALS_CONNECT_TIMEOUT: "30"
-          CALS_READ_TIMEOUT: "120"
-          CALS_MAX_RETRIES: "5"
-          CALS_BACKOFF_SEC: "3"
-          CALS_MAX_PAGES: "0"
+          # CALS 무한 대기 방지
+          CALS_CONNECT_TIMEOUT: "20"
+          CALS_READ_TIMEOUT: "60"
+          CALS_MAX_RETRIES: "3"
+          CALS_BACKOFF_SEC: "5"
+
+          # 0을 무제한으로 처리한다면 장시간 실행될 수 있으므로 제한
+          CALS_MAX_PAGES: "30"
+
         run: |
-          python integrated_steel_report.py
+          set -o pipefail
+
+          echo "===== CACHE USED BY INTEGRATED REPORT ====="
+          ls -lh data/cache
+
+          python -u integrated_steel_report.py \
+            2>&1 | tee logs/integrated_report.log
 
       - name: Copy latest report to stable filename
         run: |
@@ -72,6 +153,7 @@ jobs:
           import shutil
 
           processed = Path("data/processed")
+
           files = sorted(
               processed.glob("integrated_steel_demand_report_[0-9]*.xlsx"),
               key=lambda p: p.stat().st_mtime,
@@ -79,25 +161,39 @@ jobs:
           )
 
           if not files:
-              raise FileNotFoundError("timestamp report file not found")
+              raise FileNotFoundError(
+                  "timestamp report file not found in data/processed"
+              )
 
           latest = files[0]
           target = processed / "integrated_steel_demand_report_latest.xlsx"
+
           shutil.copy2(latest, target)
 
           print(f"latest report: {latest}")
           print(f"stable report: {target}")
           PY
 
-      - name: Commit latest report and cache
+      - name: Commit latest report
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
           git add -f data/processed/integrated_steel_demand_report_latest.xlsx
-          git add -f data/cache/archhub_basis_region_summary_latest.csv
-          git add -f data/cache/archhub_basis_normalized_latest.csv
-          git add -f data/cache/archhub_cache_meta.json
 
-          git diff --cached --quiet || git commit -m "Update latest steel demand report"
-          git push
+          if git diff --cached --quiet; then
+            echo "No report changes"
+          else
+            git commit -m "Update latest steel demand report"
+            git push
+          fi
+
+      # 실패하거나 취소되더라도 로그 확인 가능
+      - name: Upload execution logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: steel-report-logs-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 7
