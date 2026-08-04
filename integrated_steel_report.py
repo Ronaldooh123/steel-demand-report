@@ -22,6 +22,9 @@ load_dotenv()
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+BUILD_VERSION = "2026-08-04-CLOUD-RETRY-CACHE-V3"
+print(f"[BUILD VERSION] {BUILD_VERSION}")
+
 
 def get_secret(key):
     """
@@ -63,7 +66,7 @@ ARCHHUB_SIGUNGU_CD = os.getenv("ARCHHUB_SIGUNGU_CD", "11680")
 ARCHHUB_BJDONG_CD = os.getenv("ARCHHUB_BJDONG_CD", "")
 ARCHHUB_MAX_PAGES = int(os.getenv("ARCHHUB_MAX_PAGES", "1"))  # 0이면 전체 페이지
 ARCHHUB_NUM_ROWS = int(os.getenv("ARCHHUB_NUM_ROWS", "100"))
-ARCHHUB_CACHE_HOURS = int(os.getenv("ARCHHUB_CACHE_HOURS", "24"))
+ARCHHUB_CACHE_HOURS = int(os.getenv("ARCHHUB_CACHE_HOURS", "9999"))
 ARCHHUB_FORCE_REFRESH = os.getenv("ARCHHUB_FORCE_REFRESH", "false").lower() in ["1", "true", "yes", "y"]
 
 ARCHHUB_BASIS_URL = "https://apis.data.go.kr/1613000/ArchPmsHubService/getApBasisOulnInfo"
@@ -968,6 +971,12 @@ def archhub_request_page(
     num_of_rows=100,
     bjdong_cd="",
 ):
+    """
+    건축HUB 한 페이지를 조회합니다.
+
+    Streamlit Cloud/GitHub Actions에서 공공데이터포털 응답이 늦어질 수 있으므로
+    연결/읽기 시간초과, 재시도, 지수형 backoff를 적용합니다.
+    """
     params = {
         "serviceKey": require_api_key(ARCHHUB_API_KEY, "ARCHHUB_API_KEY 또는 NARA_API_KEY"),
         "sigunguCd": sigungu_cd,
@@ -981,30 +990,77 @@ def archhub_request_page(
     if str(bjdong_cd).strip() != "":
         params["bjdongCd"] = str(bjdong_cd).strip()
 
-    response = requests.get(
-        ARCHHUB_BASIS_URL,
-        params=params,
-        timeout=30,
-        verify=False,
-    )
+    connect_timeout = int(os.getenv("ARCHHUB_CONNECT_TIMEOUT", "10"))
+    read_timeout = int(os.getenv("ARCHHUB_READ_TIMEOUT", "30"))
+    max_retries = int(os.getenv("ARCHHUB_MAX_RETRIES", "2"))
+    backoff_sec = float(os.getenv("ARCHHUB_BACKOFF_SEC", "1.5"))
 
     bjdong_label = params.get("bjdongCd", "전체")
+    last_status = 0
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(
+                ARCHHUB_BASIS_URL,
+                params=params,
+                timeout=(connect_timeout, read_timeout),
+                verify=False,
+                headers={
+                    "User-Agent": "steel-demand-report/1.0",
+                    "Accept": "application/json,text/plain,*/*",
+                    "Connection": "close",
+                },
+            )
+
+            last_status = response.status_code
+
+            print(
+                f"[건축HUB] sigunguCd={sigungu_cd or '전체'} "
+                f"bjdongCd={bjdong_label} page={page_no} "
+                f"status={response.status_code} attempt={attempt}/{max_retries}"
+            )
+
+            if response.status_code in [429, 500, 502, 503, 504]:
+                last_error = RuntimeError(f"HTTP {response.status_code}")
+                time.sleep(backoff_sec * attempt)
+                continue
+
+            response.raise_for_status()
+
+            data = archhub_response_json(response)
+            if data is None:
+                last_error = RuntimeError("JSON 변환 실패")
+                time.sleep(backoff_sec * attempt)
+                continue
+
+            result_code, result_msg = archhub_get_result_info(data)
+            print(f"[건축HUB] resultCode={result_code}, resultMsg={result_msg}")
+
+            return data, response.status_code
+
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout) as exc:
+            last_error = exc
+            print(
+                f"[건축HUB 재시도] 시간초과 sigunguCd={sigungu_cd} "
+                f"page={page_no}, attempt={attempt}/{max_retries}"
+            )
+            time.sleep(backoff_sec * attempt)
+
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            print(
+                f"[건축HUB 재시도] 요청 오류 sigunguCd={sigungu_cd} "
+                f"page={page_no}, type={type(exc).__name__}, "
+                f"attempt={attempt}/{max_retries}"
+            )
+            time.sleep(backoff_sec * attempt)
 
     print(
-        f"[건축HUB] sigunguCd={sigungu_cd or '전체'} "
-        f"bjdongCd={bjdong_label} page={page_no} status={response.status_code}"
+        f"[건축HUB 경고] 최종 실패 sigunguCd={sigungu_cd}, page={page_no}, "
+        f"status={last_status}, error={type(last_error).__name__}: {last_error}"
     )
-
-    data = archhub_response_json(response)
-
-    if data is None:
-        return None, response.status_code
-
-    result_code, result_msg = archhub_get_result_info(data)
-    print(f"[건축HUB] resultCode={result_code}, resultMsg={result_msg}")
-
-    return data, response.status_code
-
+    return None, last_status
 
 def collect_archhub_basis_by_sigungu(
     sigungu_cd,
@@ -1466,6 +1522,90 @@ def collect_archhub():
 
 
 # =========================================================
+# 나라장터 / CALS 결과 캐시
+# =========================================================
+
+NARA_CACHE_FILES = {
+    "all": CACHE_PATH / "nara_all_latest.csv",
+    "steel": CACHE_PATH / "nara_steel_latest.csv",
+    "keyword": CACHE_PATH / "nara_keyword_latest.csv",
+    "agency": CACHE_PATH / "nara_agency_latest.csv",
+    "region": CACHE_PATH / "nara_region_latest.csv",
+}
+
+CALS_CACHE_FILES = {
+    "all": CACHE_PATH / "cals_all_latest.csv",
+    "region": CACHE_PATH / "cals_region_latest.csv",
+    "field": CACHE_PATH / "cals_region_field_latest.csv",
+    "agency": CACHE_PATH / "cals_agency_latest.csv",
+    "demand": CACHE_PATH / "cals_demand_latest.csv",
+}
+
+
+def _read_cached_csv(path):
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return pd.DataFrame()
+        return pd.read_csv(path, encoding="utf-8-sig")
+    except Exception as exc:
+        print(f"[캐시 경고] 읽기 실패: {path.name} / {exc}")
+        return pd.DataFrame()
+
+
+def _save_cached_csv(df, path):
+    try:
+        if df is None:
+            df = pd.DataFrame()
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+    except Exception as exc:
+        print(f"[캐시 경고] 저장 실패: {path.name} / {exc}")
+
+
+def save_nara_cache(nara_df, nara_steel_df, keyword_summary, agency_summary, region_summary):
+    _save_cached_csv(nara_df, NARA_CACHE_FILES["all"])
+    _save_cached_csv(nara_steel_df, NARA_CACHE_FILES["steel"])
+    _save_cached_csv(keyword_summary, NARA_CACHE_FILES["keyword"])
+    _save_cached_csv(agency_summary, NARA_CACHE_FILES["agency"])
+    _save_cached_csv(region_summary, NARA_CACHE_FILES["region"])
+    print("[나라장터] 최신 성공 결과를 캐시에 저장했습니다.")
+
+
+def load_nara_cache():
+    values = (
+        _read_cached_csv(NARA_CACHE_FILES["all"]),
+        _read_cached_csv(NARA_CACHE_FILES["steel"]),
+        _read_cached_csv(NARA_CACHE_FILES["keyword"]),
+        _read_cached_csv(NARA_CACHE_FILES["agency"]),
+        _read_cached_csv(NARA_CACHE_FILES["region"]),
+    )
+    if any(not df.empty for df in values):
+        print("[나라장터] API 실패로 기존 캐시를 사용합니다.")
+    return values
+
+
+def save_cals_cache(cals_df, region_summary, field_summary, agency_summary, demand_summary):
+    _save_cached_csv(cals_df, CALS_CACHE_FILES["all"])
+    _save_cached_csv(region_summary, CALS_CACHE_FILES["region"])
+    _save_cached_csv(field_summary, CALS_CACHE_FILES["field"])
+    _save_cached_csv(agency_summary, CALS_CACHE_FILES["agency"])
+    _save_cached_csv(demand_summary, CALS_CACHE_FILES["demand"])
+    print("[건설CALS] 최신 성공 결과를 캐시에 저장했습니다.")
+
+
+def load_cals_cache():
+    values = (
+        _read_cached_csv(CALS_CACHE_FILES["all"]),
+        _read_cached_csv(CALS_CACHE_FILES["region"]),
+        _read_cached_csv(CALS_CACHE_FILES["field"]),
+        _read_cached_csv(CALS_CACHE_FILES["agency"]),
+        _read_cached_csv(CALS_CACHE_FILES["demand"]),
+    )
+    if any(not df.empty for df in values):
+        print("[건설CALS] API 실패로 기존 캐시를 사용합니다.")
+    return values
+
+
+# =========================================================
 # 1. 나라장터 공사입찰 수집
 # =========================================================
 
@@ -1479,15 +1619,15 @@ def collect_narajangteo():
 
     # 나라장터도 Streamlit/GitHub Actions 같은 클라우드 환경에서 간헐적으로
     # read timeout이 발생할 수 있어 CALS와 동일하게 재시도 로직을 둡니다.
+    # Streamlit Cloud에서 port 80(HTTP) 요청이 자주 지연되므로 HTTPS만 사용합니다.
     base_urls = [
-        "http://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoCnstwk",
         "https://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoCnstwk",
     ]
 
     num_of_rows = int(os.getenv("NARA_NUM_ROWS", "100"))
-    connect_timeout = int(os.getenv("NARA_CONNECT_TIMEOUT", "15"))
-    read_timeout = int(os.getenv("NARA_READ_TIMEOUT", "90"))
-    max_retries = int(os.getenv("NARA_MAX_RETRIES", "5"))
+    connect_timeout = int(os.getenv("NARA_CONNECT_TIMEOUT", "10"))
+    read_timeout = int(os.getenv("NARA_READ_TIMEOUT", "45"))
+    max_retries = int(os.getenv("NARA_MAX_RETRIES", "3"))
     backoff_sec = float(os.getenv("NARA_BACKOFF_SEC", "2.0"))
     max_pages_limit = int(os.getenv("NARA_MAX_PAGES", "0"))  # 0이면 전체 페이지
 
@@ -1545,10 +1685,29 @@ def collect_narajangteo():
                     response.raise_for_status()
 
                     try:
-                        return response.json()
+                        data = response.json()
                     except Exception as exc:
-                        preview = (response.text or "")[:500]
-                        raise ValueError(f"나라장터 JSON 변환 실패: {preview}") from exc
+                        preview = mask_error((response.text or "")[:500])
+                        last_error = ValueError(f"나라장터 JSON 변환 실패: {preview}")
+                        print(
+                            f"[나라장터 재시도] JSON 변환 실패 page={page_no}, "
+                            f"attempt={attempt}/{max_retries}"
+                        )
+                        time.sleep(backoff_sec * attempt)
+                        continue
+
+                    if not isinstance(data, dict) or "response" not in data:
+                        last_error = ValueError(
+                            f"나라장터 응답 구조 이상: {mask_error(str(data)[:500])}"
+                        )
+                        print(
+                            f"[나라장터 재시도] 응답 구조 이상 page={page_no}, "
+                            f"attempt={attempt}/{max_retries}"
+                        )
+                        time.sleep(backoff_sec * attempt)
+                        continue
+
+                    return data
 
                 except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout) as exc:
                     last_error = exc
@@ -1592,20 +1751,12 @@ def collect_narajangteo():
     print("나라장터 전체 입찰 건수:", total_count)
     print("나라장터 전체 페이지 수:", total_pages)
 
-    all_items = []
+    def extract_nara_items(page_body):
+        items = page_body.get("items", []) if isinstance(page_body, dict) else []
 
-    first_items = body.get("items", [])
-    if isinstance(first_items, dict):
-        first_items = [first_items]
-    if first_items is None:
-        first_items = []
-
-    all_items.extend(first_items)
-    print(f"나라장터 1/{total_pages} 페이지 수집 완료 - 누적 {len(all_items)}건")
-
-    for page in range(2, total_pages + 1):
-        data = get_nara_page(page)
-        items = data["response"]["body"].get("items", [])
+        # 공공데이터포털 응답이 {"items": {"item": [...]}} 형태인 경우도 처리합니다.
+        if isinstance(items, dict) and "item" in items:
+            items = items.get("item", [])
 
         if isinstance(items, dict):
             items = [items]
@@ -1613,15 +1764,49 @@ def collect_narajangteo():
         if items is None:
             items = []
 
-        all_items.extend(items)
+        return items
 
-        print(f"나라장터 {page}/{total_pages} 페이지 수집 완료 - 누적 {len(all_items)}건")
-        time.sleep(0.2)
+    all_items = []
+    failed_pages = []
+
+    first_items = extract_nara_items(body)
+    all_items.extend(first_items)
+    print(f"나라장터 1/{total_pages} 페이지 수집 완료 - 누적 {len(all_items)}건")
+
+    for page in range(2, total_pages + 1):
+        try:
+            data = get_nara_page(page)
+            page_body = data.get("response", {}).get("body", {})
+            items = extract_nara_items(page_body)
+            all_items.extend(items)
+
+            print(
+                f"나라장터 {page}/{total_pages} 페이지 수집 완료 "
+                f"- 누적 {len(all_items)}건"
+            )
+
+        except Exception as exc:
+            failed_pages.append(page)
+            print(
+                f"[나라장터 경고] {page}페이지 최종 실패. "
+                f"해당 페이지만 제외하고 계속합니다: {type(exc).__name__}: {exc}"
+            )
+
+        time.sleep(float(os.getenv("NARA_PAGE_DELAY", "0.15")))
+
+    if failed_pages:
+        print(
+            f"[나라장터 경고] 실패 페이지 {len(failed_pages)}개: "
+            f"{failed_pages[:20]}"
+        )
 
     df = pd.DataFrame(all_items)
 
     if df.empty:
         print("나라장터 조회 데이터가 없습니다.")
+        cached = load_nara_cache()
+        if any(not item.empty for item in cached):
+            return cached
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     selected_cols = [
@@ -1760,6 +1945,14 @@ def collect_narajangteo():
         range(1, len(nara_region_summary) + 1)
     )
 
+    save_nara_cache(
+        df,
+        df_steel,
+        keyword_summary,
+        agency_summary,
+        nara_region_summary,
+    )
+
     return df, df_steel, keyword_summary, agency_summary, nara_region_summary
 
 
@@ -1777,17 +1970,15 @@ def collect_calspia():
 
     # CALS는 외부 클라우드/Streamlit Cloud 환경에서 간헐적으로 연결 지연이 발생할 수 있어
     # 단일 요청 실패로 전체 리포트가 중단되지 않도록 재시도 로직을 둡니다.
+    # HTTP 보조 URL은 클라우드 환경에서 오히려 대기시간을 늘리므로 HTTPS만 사용합니다.
     base_urls = [
         "https://www.calspia.go.kr/io/openapi/cm/selectIoCmConstructionList.do",
-        # HTTPS 연결이 일시적으로 불안정할 때를 대비한 보조 후보입니다.
-        # 서버 정책에 따라 HTTP가 차단될 수 있으며, 이 경우 자동으로 다음 재시도에서 무시됩니다.
-        "http://www.calspia.go.kr/io/openapi/cm/selectIoCmConstructionList.do",
     ]
 
     num_of_rows = int(os.getenv("CALS_NUM_ROWS", "100"))
-    connect_timeout = int(os.getenv("CALS_CONNECT_TIMEOUT", "15"))
-    read_timeout = int(os.getenv("CALS_READ_TIMEOUT", "60"))
-    max_retries = int(os.getenv("CALS_MAX_RETRIES", "3"))
+    connect_timeout = int(os.getenv("CALS_CONNECT_TIMEOUT", "10"))
+    read_timeout = int(os.getenv("CALS_READ_TIMEOUT", "30"))
+    max_retries = int(os.getenv("CALS_MAX_RETRIES", "2"))
     backoff_sec = float(os.getenv("CALS_BACKOFF_SEC", "2.0"))
     max_pages_limit = int(os.getenv("CALS_MAX_PAGES", "0"))  # 0이면 전체 페이지
 
@@ -1847,13 +2038,26 @@ def collect_calspia():
                         data = response.json()
                     except Exception as exc:
                         preview = mask_sensitive((response.text or "")[:300])
-                        raise RuntimeError(
-                            f"CALS JSON 변환 실패: {type(exc).__name__}, 응답앞부분={preview}"
-                        ) from exc
+                        last_error = RuntimeError(
+                            f"CALS JSON 변환 실패: {type(exc).__name__}, "
+                            f"응답앞부분={preview}"
+                        )
+                        print(
+                            f"[건설CALS 재시도] JSON 변환 실패 "
+                            f"page={page_no}, attempt={attempt}/{max_retries}"
+                        )
+                        time.sleep(backoff_sec * attempt)
+                        continue
 
                     if not isinstance(data, dict) or "response" not in data:
                         preview = mask_sensitive(str(data)[:300])
-                        raise RuntimeError(f"CALS 응답 구조 이상: {preview}")
+                        last_error = RuntimeError(f"CALS 응답 구조 이상: {preview}")
+                        print(
+                            f"[건설CALS 재시도] 응답 구조 이상 "
+                            f"page={page_no}, attempt={attempt}/{max_retries}"
+                        )
+                        time.sleep(backoff_sec * attempt)
+                        continue
 
                     return data
 
@@ -1882,8 +2086,13 @@ def collect_calspia():
                     time.sleep(backoff_sec * attempt)
 
                 except Exception as exc:
-                    # JSON 파싱/응답 구조 문제는 네트워크 문제가 아닐 수 있으므로 즉시 중단합니다.
-                    raise RuntimeError(mask_sensitive(str(exc))) from exc
+                    last_error = exc
+                    print(
+                        f"[건설CALS 재시도] 기타 오류 "
+                        f"page={page_no}, type={type(exc).__name__}, "
+                        f"attempt={attempt}/{max_retries}"
+                    )
+                    time.sleep(backoff_sec * attempt)
 
         error_type = type(last_error).__name__ if last_error is not None else "UnknownError"
         error_msg = mask_sensitive(str(last_error))[:500] if last_error is not None else "원인 미상"
@@ -1904,32 +2113,62 @@ def collect_calspia():
     print("건설CALS 전체 공사 건수:", total_count)
     print("건설CALS 전체 페이지 수:", total_pages)
 
-    first_items = body.get("items", [])
+    def extract_cals_items(page_body):
+        items = page_body.get("items", []) if isinstance(page_body, dict) else []
 
-    if isinstance(first_items, dict):
-        first_items = [first_items]
+        if isinstance(items, dict) and "item" in items:
+            items = items.get("item", [])
 
+        if isinstance(items, dict):
+            items = [items]
+
+        if items is None:
+            items = []
+
+        return items
+
+    failed_pages = []
+
+    first_items = extract_cals_items(body)
     if first_items:
         all_items.extend(first_items)
 
     print(f"건설CALS 1/{total_pages} 페이지 수집 완료 - 누적 {len(all_items)}건")
 
     for page in range(2, total_pages + 1):
-        data = request_cals_page(page)
-        items = data.get("response", {}).get("body", {}).get("items", [])
+        try:
+            data = request_cals_page(page)
+            page_body = data.get("response", {}).get("body", {})
+            items = extract_cals_items(page_body)
+            all_items.extend(items)
 
-        if isinstance(items, dict):
-            items = [items]
+            print(
+                f"건설CALS {page}/{total_pages} 페이지 수집 완료 "
+                f"- 누적 {len(all_items)}건"
+            )
 
-        all_items.extend(items)
+        except Exception as exc:
+            failed_pages.append(page)
+            print(
+                f"[건설CALS 경고] {page}페이지 최종 실패. "
+                f"해당 페이지만 제외하고 계속합니다: {type(exc).__name__}: {exc}"
+            )
 
-        print(f"건설CALS {page}/{total_pages} 페이지 수집 완료 - 누적 {len(all_items)}건")
-        time.sleep(0.2)
+        time.sleep(float(os.getenv("CALS_PAGE_DELAY", "0.15")))
+
+    if failed_pages:
+        print(
+            f"[건설CALS 경고] 실패 페이지 {len(failed_pages)}개: "
+            f"{failed_pages[:20]}"
+        )
 
     df = pd.DataFrame(all_items)
 
     if df.empty:
         print("건설CALS 조회 데이터가 없습니다.")
+        cached = load_cals_cache()
+        if any(not item.empty for item in cached):
+            return cached
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     selected_cols = [
@@ -2027,6 +2266,14 @@ def collect_calspia():
         0,
         "수요순위",
         range(1, len(cals_demand_summary) + 1)
+    )
+
+    save_cals_cache(
+        df,
+        region_summary,
+        region_field_summary,
+        agency_summary,
+        cals_demand_summary,
     )
 
     return df, region_summary, region_field_summary, agency_summary, cals_demand_summary
@@ -2879,16 +3126,37 @@ if __name__ == "__main__":
         print(f"[나라장터 경고] 오류유형: {type(exc).__name__}")
         print(f"[나라장터 경고] 오류요약: {safe_error[:500]}")
 
-        nara_df = pd.DataFrame()
-        nara_steel_df = pd.DataFrame()
-        keyword_summary = pd.DataFrame(columns=["순위", "키워드", "입찰건수"])
-        nara_agency_summary = pd.DataFrame(columns=["순위", "dminsttNm", "철근관련입찰건수"])
-        nara_region_summary = pd.DataFrame(columns=[
-            "순위",
-            "region",
-            "나라장터_철근관련입찰건수",
-            "나라장터_추정가격합계",
-        ])
+        (
+            nara_df,
+            nara_steel_df,
+            keyword_summary,
+            nara_agency_summary,
+            nara_region_summary,
+        ) = load_nara_cache()
+
+        if not any(
+            not item.empty
+            for item in [
+                nara_df,
+                nara_steel_df,
+                keyword_summary,
+                nara_agency_summary,
+                nara_region_summary,
+            ]
+        ):
+            print("[나라장터 경고] 사용 가능한 기존 캐시도 없습니다.")
+            nara_df = pd.DataFrame()
+            nara_steel_df = pd.DataFrame()
+            keyword_summary = pd.DataFrame(columns=["순위", "키워드", "입찰건수"])
+            nara_agency_summary = pd.DataFrame(
+                columns=["순위", "dminsttNm", "철근관련입찰건수"]
+            )
+            nara_region_summary = pd.DataFrame(columns=[
+                "순위",
+                "region",
+                "나라장터_철근관련입찰건수",
+                "나라장터_추정가격합계",
+            ])
 
     try:
         cals_df, cals_region_summary, cals_region_field_summary, cals_agency_summary, cals_demand_summary = collect_calspia()
@@ -2899,29 +3167,48 @@ if __name__ == "__main__":
         print(f"[건설CALS 경고] 오류유형: {type(exc).__name__}")
         print(f"[건설CALS 경고] 오류요약: {safe_error[:500]}")
 
-        cals_df = pd.DataFrame()
-        cals_region_summary = pd.DataFrame(columns=[
-            "순위",
-            "region",
-            "건설CALS_진행공사건수",
-        ])
-        cals_region_field_summary = pd.DataFrame(columns=[
-            "region",
-            "bzarNm",
-            "공사건수",
-            "철근가중치",
-            "건설CALS_철근수요지수",
-        ])
-        cals_agency_summary = pd.DataFrame(columns=[
-            "순위",
-            "ornm",
-            "진행공사건수",
-        ])
-        cals_demand_summary = pd.DataFrame(columns=[
-            "수요순위",
-            "region",
-            "건설CALS_철근수요지수",
-        ])
+        (
+            cals_df,
+            cals_region_summary,
+            cals_region_field_summary,
+            cals_agency_summary,
+            cals_demand_summary,
+        ) = load_cals_cache()
+
+        if not any(
+            not item.empty
+            for item in [
+                cals_df,
+                cals_region_summary,
+                cals_region_field_summary,
+                cals_agency_summary,
+                cals_demand_summary,
+            ]
+        ):
+            print("[건설CALS 경고] 사용 가능한 기존 캐시도 없습니다.")
+            cals_df = pd.DataFrame()
+            cals_region_summary = pd.DataFrame(columns=[
+                "순위",
+                "region",
+                "건설CALS_진행공사건수",
+            ])
+            cals_region_field_summary = pd.DataFrame(columns=[
+                "region",
+                "bzarNm",
+                "공사건수",
+                "철근가중치",
+                "건설CALS_철근수요지수",
+            ])
+            cals_agency_summary = pd.DataFrame(columns=[
+                "순위",
+                "ornm",
+                "진행공사건수",
+            ])
+            cals_demand_summary = pd.DataFrame(columns=[
+                "수요순위",
+                "region",
+                "건설CALS_철근수요지수",
+            ])
 
     try:
         archhub_df, archhub_region_summary = collect_archhub()
